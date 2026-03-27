@@ -1,74 +1,79 @@
-# Changelog — DataShredder v2.0.0
+# Changelog — DataShredder v3.0.0
 
-All changes relative to **v1.0.0**.
+All changes relative to **v2.0.0**.
 
 ---
 
 ## New Features
 
-### Multiple shred algorithms
-A `ShredAlgorithm` enum was introduced with five selectable options, exposed via a `JComboBox` in the UI:
+### ChaCha20 cryptographic erase (`CRYPTO_ERASE`)
+A sixth algorithm was added that encrypts the file in-place using ChaCha20 (standard JCA, Java 11+, no third-party library). A 256-bit key and 96-bit nonce are generated with `SecureRandom`, used to stream-encrypt the file chunk by chunk via `Cipher.update()` / `Cipher.doFinal()`, and then immediately zeroed in a `finally` block with `Arrays.fill`. Without the key, the ciphertext is computationally indistinguishable from random noise.
 
-| Algorithm | Passes | Notes |
-|---|---|---|
-| RANDOM | 1 – 100 (configurable) | Carried over from v1 |
-| DOD3 | 3 (fixed) | DoD 5220.22-M: zeros → ones → random |
-| GUTMANN | 35 (fixed) | All 35 patterns in deterministic paper order |
-| ZERO | 1 (fixed) | Zero-fill with post-write byte verification |
-| NVME_PURGE | 4 (fixed) | NIST SP 800-88 inspired; ends with zeros + verification |
+Unlike every other algorithm, CRYPTO_ERASE does **not** delete the file after encryption — the content is already unrecoverable.
 
-Selecting a fixed-pass algorithm automatically locks the passes spinner and sets the correct value.
+> This replaces a broken Kyber implementation from an earlier branch that cast a JCA `PublicKey` to `KyberPublicKeyParameters` (causing `ClassCastException`), mixed raw and JCA API usage, and required a BouncyCastle PQC dependency that was never included.
 
-### Directory support
-`JFileChooser` mode changed from `FILES_ONLY` to `FILES_AND_DIRECTORIES`. A new `collectFiles()` method uses `Files.walk()` inside a try-with-resources block to recursively enumerate all regular files inside selected directories, skipping symbolic links via `LinkOption.NOFOLLOW_LINKS`.
+### Filename scrubbing
+Before deletion, `scrubFilename()` performs three sequential `Files.move()` renames to randomly generated names. `ATOMIC_MOVE` is requested first; a non-atomic fallback is used if the file system does not support it. Overwriting the directory entry multiple times frustrates inode-level name recovery.
 
-### Cancel button
-A **Cancel** button was added to the toolbar. Clicking it prompts a confirmation dialog, then sets `shreddingActive = false`. The background thread checks this flag between write chunks and after each file, stopping cleanly without abrupt interruption.
+> Fixed from a prior version where a dummy file was created at the destination path, the real file was moved onto it with `ATOMIC_MOVE`, and then `currentPath` was deleted — deleting the file that had just been moved. The method now does a pure rename chain with no dummy file.
 
-### Live ETA in progress bar
-Progress reporting was upgraded from a bare percentage to `XX% — HH:MM:SS remaining`. Speed (`averageSpeedKBs`) is computed from elapsed time and bytes processed. A `formatTime()` helper converts remaining seconds to `HH:MM:SS`, guarding against `NaN` and `Infinity`. Progress state (`totalBytes`, `processedBytes`, `startTimeMs`, `averageSpeedKBs`) is tracked as `volatile` class fields rather than local lambda captures.
+### Metadata scrubbing
+After filename scrubbing, `scrubMetadata()` sets all three file timestamps (creation, last-modified, last-access) to `FileTime.fromMillis(0)` (Unix epoch) via `BasicFileAttributeView`. Failures are silently ignored since not all file systems support all timestamp fields.
 
-### File locking
-`shredFile()` now opens a `FileChannel` alongside the `RandomAccessFile` and calls `channel.tryLock()`. If another process holds the file, `lock` is `null` and an `IOException` is thrown immediately, reporting the conflict to the user instead of silently overwriting a partially-locked file.
+### Post-shred directory deletion
+`collectDirectories()` enumerates all sub-directories of selected inputs and sorts them by absolute-path length descending, ensuring deepest children are processed before their parents. After all files are shredded, each directory is scrubbed and deleted in this order.
 
-### Global uncaught-exception handler
-`Thread.setDefaultUncaughtExceptionHandler` is registered in `main()` to catch any unhandled exception and show an error dialog rather than letting the JVM exit silently.
+### Dark mode theming
+`isDarkModeEnabled()` returns `true` (hardcoded). When enabled, `main()` applies a full `UIManager` colour palette covering panels, labels, buttons, combo boxes, spinners, option panes, and formatted text fields. A comment in the method explains how to replace the hardcoded value with automatic OS-level detection using `com.jthemedetecor`.
 
-### `channel.force(true)` flush
-After all passes, `channel.force(true)` is called to flush both file data and metadata to the storage device, supplementing the per-pass `fd.sync()` already present in v1.
+### Transient per-file progress messages
+`showTransientMessage()` temporarily replaces the ETA string on the progress bar with a per-file status ("Obliterated: …" / "Encrypted: …"), then reverts to the ETA display after 2.5 seconds using a non-repeating `javax.swing.Timer`. A `stopMessageTimer()` guard prevents overlapping timers.
+
+> Fixed from a prior version where the timer rescheduled itself on every fire, creating an unbounded chain of nested timers.
+
+### Progress bar colour feedback
+The progress bar changes colour to reflect state: **green** while shredding, **red** on cancel, **grey** when idle or after reset. A `resetTimer` (non-repeating, 3 s) restores the idle appearance after cancellation or completion.
+
+### Spinner input validation
+`NumberFormatter.setAllowsInvalid(false)` is applied to the passes spinner's editor, blocking any non-numeric characters from being typed.
+
+### 1 MB write buffer
+`BUFFER_SIZE` increased from 65 536 bytes (64 KB) to 1 048 576 bytes (1 MB), reducing I/O overhead on modern drives with large sector sizes and write-combining hardware.
 
 ---
 
 ## Bug Fixes
 
-### Zero-fill verification now correctly scoped
-In a prior version, `verifyZeroFill()` was called after every algorithm — including RANDOM, DOD3, and GUTMANN — which always threw an `IOException` because those algorithms do not end with a zero pass. Verification is now gated on `algo.requiresZeroVerification`, a flag that is `true` only for ZERO and NVME_PURGE.
+### `scrubFilename` no longer deletes the file being renamed
+The prior implementation created a dummy file at the rename target, moved the real file onto it with `ATOMIC_MOVE`, then deleted `currentPath` — which was now pointing at the file that had just been moved away. The fix uses a plain rename chain: `current → next → next → next`, with no dummy file created at any step.
 
-### `overwritePattern` progress now recorded
-The `overwritePattern()` method was missing a `recordProgress()` call, causing the progress bar to stall during zero-fill and ones-fill passes. The call was added inside the write loop.
+### Progress bar no longer updates when canceled
+`recordProgress()` now checks `shreddingActive` before posting to the EDT, preventing stale percentage updates from appearing after the user cancels.
 
-### DoD3 pass order corrected
-The original DoD3 implementation wrote in the wrong order. The correct DoD 5220.22-M sequence (zeros → ones → random) is now applied.
+### Timer leak eliminated
+The self-rescheduling progress timer from a prior version has been replaced with direct `SwingUtilities.invokeLater` calls from `recordProgress()`, with a separate non-repeating `messageTimer` for transient messages only.
 
-### `Files.walk` stream leak fixed
-`Files.walk()` in `collectFiles()` is now wrapped in try-with-resources, ensuring the underlying directory stream is closed even if an `IOException` is thrown mid-walk.
-
-### Deletion retry window reduced
-The original deletion retry logic had delays that could accumulate to roughly 102 seconds. v2 retries up to 3 times with 200 ms between attempts. The last-resort fallback renames the file and schedules `deleteOnExit()`.
-
-### `generateRandomName` uses shared `SecureRandom`
-The utility now uses the class-level `RANDOM` instance instead of allocating a fresh `SecureRandom` per call, avoiding the cost of repeated entropy seeding.
+### `Files.walk` stream leak (carried from v2, confirmed closed)
+`collectFiles()` and the new `collectDirectories()` both use try-with-resources to guarantee the `Stream<Path>` is closed on any exit path.
 
 ---
 
 ## UI Changes
 
-- Layout upgraded from `FlowLayout` to `GridBagLayout` for cleaner alignment.
-- Window width increased from 585 px to 700 px; `setResizable(false)` added.
-- **Browse** button label changed to **Browse Files/Dirs** to reflect directory support.
-- **Shred** button label changed to **Secure Shred**.
-- **Cancel** button added (initially disabled; enabled only during shredding).
-- Progress bar label format changed from `"XX%"` to `"XX% — HH:MM:SS remaining"`.
-- File-path label supports both files and directories in its preview text.
-- `showFinalReport()` gains a `wasCanceled` parameter; shows a `WARNING_MESSAGE` icon when the run was cancelled or had errors.
-- `showError()` helper added for displaying formatted error dialogs from the background thread.
+- Progress bar text colour forced to black on both themes via a custom `BasicProgressBarUI` subclass overriding `getSelectionForeground` / `getSelectionBackground`.
+- Progress bar foreground is green during shredding, red on cancel, grey when idle.
+- Transient "Obliterated: …" / "Encrypted: …" labels flash per file, reverting to ETA after 2.5 s.
+- Result dialog is **non-modal** on a clean run so the `resetTimer` can still fire behind it; remains modal when there are errors or a cancellation.
+- Cancel button turns the progress bar red and schedules a 3-second visual reset.
+- Window title changed from **"File Shredder v2.0.0"** to **"Data Shredder v3.0.0"**.
+- `showFinalReport()` calls `stopMessageTimer()` before displaying the dialog to avoid a stale message overwriting the final result string.
+
+---
+
+## Internal / Non-Visible Changes
+
+- `main()` moved `UIManager.setLookAndFeel` and dark-mode setup outside `invokeLater` so the palette is applied before any Swing component is created.
+- `runShredding` is split into a files loop and a separate directories loop, both inside a single method (no longer uses a `finally` block for UI reset — reset is done inline after both loops complete).
+- `getTotalPasses` updated to handle `CRYPTO_ERASE` returning `1`; the progress multiplier in `startShreddingProcess` is capped at `1` for `CRYPTO_ERASE` regardless.
+- `generateRandomName` generates names of variable length (8–16 characters) instead of a fixed 12 characters.
