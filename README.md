@@ -36,7 +36,7 @@ A full-featured Java Swing file and directory shredder with cryptographic erase,
 
 > **CRYPTO_ERASE behaviour:** The encrypted file is left on disk (content unrecoverable); standard deletion is skipped. The key and nonce are zeroed in a `finally` block to prevent heap retention.
 
-> **Note on Gutmann:** Pattern order is deterministic as the paper specifies. Shuffling defeats the algorithm and was deliberately removed.
+> **Note on Gutmann:** Pattern order is deterministic as the paper specifies.
 
 ---
 
