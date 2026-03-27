@@ -27,9 +27,9 @@ A multi-algorithm Java Swing file and directory shredder with cancellation suppo
 | **ZERO** | 1 (fixed) | Single zero-fill pass followed by byte-level verification |
 | **NVME_PURGE** | 4 (fixed) | NIST SP 800-88 inspired: random key pattern → complement → random → zeros + verification |
 
-> **Note on Gutmann:** Patterns are applied in the original deterministic order specified by the paper. Shuffling the patterns (a common mistake) defeats the algorithm.
+> **Note on Gutmann:** Patterns are applied in the original deterministic order specified by the paper.
 
-> **Note on DoD3:** Correct order is zeros → ones → random. Inverted orderings seen in other implementations are incorrect.
+> **Note on DoD3:** Correct order is zeros → ones → random.
 
 ---
 
