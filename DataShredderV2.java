@@ -248,10 +248,6 @@ public class DataShredderV2 extends JFrame {
             return;
         }
 
-        // NOTE: containsSSDLocation is intentionally a stub.
-        // Real SSD detection requires native OS calls (WMI on Windows, diskutil on macOS).
-        // Path-name heuristics produce too many false positives to be useful.
-
         int confirm = JOptionPane.showConfirmDialog(this,
                 "This will permanently destroy " + filesToProcess.size() + " file(s).\nProceed?",
                 "Confirmation", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
@@ -413,7 +409,7 @@ public class DataShredderV2 extends JFrame {
             int writeSize = (int) Math.min(buffer.length, length - written);
             raf.write(buffer, 0, writeSize);
             written += writeSize;
-            recordProgress(writeSize); // was missing in original, causing stalled progress
+            recordProgress(writeSize);
         }
         raf.getFD().sync();
     }
@@ -451,7 +447,6 @@ public class DataShredderV2 extends JFrame {
     /**
      * Gutmann 35-pass wipe.
      * Patterns are applied in the original deterministic order specified by the paper.
-     * Shuffling the patterns (as seen in some versions) defeats the algorithm entirely.
      */
     private void overwriteGutmann(RandomAccessFile raf, byte[] buffer, long length)
             throws IOException {
@@ -532,8 +527,6 @@ public class DataShredderV2 extends JFrame {
     /**
      * Verifies that every byte in the file is 0x00.
      * Only called for algorithms whose last pass writes zeros (ZERO, NVME_PURGE).
-     * Was incorrectly called after RANDOM/DOD3/GUTMANN in the original code,
-     * guaranteeing an IOException for every shred operation with those algorithms.
      */
     private void verifyZeroFill(File file) throws IOException {
         byte[] buffer = new byte[BUFFER_SIZE];
