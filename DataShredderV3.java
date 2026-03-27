@@ -275,7 +275,6 @@ public class DataShredderV3 extends JFrame {
 
     /**
      * Recursively expands directories into regular files only.
-     * Files.walk stream closed via try-with-resources (was leaking in original).
      */
     private List<File> collectFiles(List<File> inputs) {
         List<File> result = new ArrayList<>();
@@ -557,7 +556,6 @@ public class DataShredderV3 extends JFrame {
     /**
      * Gutmann 35-pass wipe.
      * Pattern order is deterministic as specified by the paper.
-     * Shuffling the patterns defeats the algorithm and was removed.
      */
     private void overwriteGutmann(RandomAccessFile raf, byte[] buffer, long length)
             throws IOException {
@@ -629,11 +627,6 @@ public class DataShredderV3 extends JFrame {
      * A random 256-bit key and 96-bit nonce are generated, used to encrypt the
      * file in-place, then securely wiped from memory. Without the key the
      * ciphertext is computationally indistinguishable from random noise.
-     *
-     * This replaces the broken Kyber implementation from v7 which:
-     *   (a) cast a JCA PublicKey to KyberPublicKeyParameters, causing ClassCastException
-     *   (b) had mixed raw-API and JCA-API usage that could not compile correctly
-     *   (c) required a third-party BouncyCastle PQC dependency
      *
      * ChaCha20 is available in the standard JDK (Java 11+) with no extra dependencies.
      */
@@ -732,10 +725,6 @@ public class DataShredderV3 extends JFrame {
 
     /**
      * Renames the file three times to random names to frustrate directory-entry recovery.
-     *
-     * Fixed from v7: the original created a dummy file at newPath, moved the real file
-     * onto it (ATOMIC_MOVE), then deleted currentPath — deleting the file we just moved.
-     * The file was gone after the very first iteration. This version is a pure rename chain.
      */
     private File scrubFilename(File file) throws IOException {
         Path current = file.toPath();
@@ -779,9 +768,6 @@ public class DataShredderV3 extends JFrame {
 
     /**
      * Records bytes written and updates the progress bar on the EDT.
-     *
-     * Fixed: original called this from a self-rescheduling Timer, creating unlimited
-     * nested timers. Now it posts directly to the EDT — no timer involved.
      */
     private synchronized void recordProgress(int bytes) {
         processedBytes += bytes;
@@ -809,9 +795,6 @@ public class DataShredderV3 extends JFrame {
     /**
      * Shows a transient file-specific message on the progress bar,
      * then reverts to the ETA display after 2.5 seconds.
-     *
-     * Fixed: the timer fires once (not repeating) and does NOT reschedule itself,
-     * so there is no timer leak.
      */
     private void showTransientMessage(String message) {
         stopMessageTimer();
@@ -920,7 +903,6 @@ public class DataShredderV3 extends JFrame {
 
     /**
      * Generates a random filename using the class-level RANDOM instance.
-     * Original allocated a new SecureRandom() on every call (expensive + wrong).
      */
     private String generateRandomName() {
         final String chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
