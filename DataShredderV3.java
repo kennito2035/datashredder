@@ -1,5 +1,5 @@
 /**
- * DataShredder v3.0.0
+ * DataShredder v3.0.1
  *
  * Full-featured file/directory shredder with crypto erase, filename scrubbing,
  * metadata scrubbing, dark-mode theming, and live ETA.
@@ -95,6 +95,10 @@ public class DataShredderV3 extends JFrame {
     private volatile long    startTimeMs      = 0;
     private volatile double  averageSpeedKBs  = 0;
 
+    // Progress-throttle state; guarded by the synchronized recordProgress
+    private long lastPostedPct  = -1;
+    private long lastPostedAtMs = 0;
+
     // -------------------------------------------------------------------------
     // Construction
     // -------------------------------------------------------------------------
@@ -126,7 +130,7 @@ public class DataShredderV3 extends JFrame {
     // -------------------------------------------------------------------------
 
     private void initializeUI() {
-        setTitle("Data Shredder v3.0.0");
+        setTitle("Data Shredder v3.0.1");
         setSize(700, 300);
         setResizable(false);
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
@@ -355,87 +359,103 @@ public class DataShredderV3 extends JFrame {
         startTimeMs     = System.currentTimeMillis();
         averageSpeedKBs = 0;
         processedBytes  = 0;
+        lastPostedPct   = -1;
+        lastPostedAtMs  = 0;
 
-        // CRYPTO_ERASE reads + writes each byte once; all others multiply by pass count
-        int passMultiplier = (algo == ShredAlgorithm.CRYPTO_ERASE) ? 1 : getTotalPasses(algo);
+        // CRYPTO_ERASE reads + writes each byte once, so its multiplier is 1.
+        // Captured on the EDT; the worker must not touch the Swing spinner.
+        int passMultiplier = getTotalPasses(algo);
         totalBytes = filesToProcess.stream().mapToLong(File::length).sum() * passMultiplier;
 
-        new Thread(() -> runShredding(filesToProcess, dirsToDelete, algo), "shredder-thread").start();
+        new Thread(() -> runShredding(filesToProcess, dirsToDelete, algo, passMultiplier), "shredder-thread").start();
     }
 
-    private void runShredding(List<File> files, List<File> dirs, ShredAlgorithm algo) {
+    private void runShredding(List<File> files, List<File> dirs, ShredAlgorithm algo, int passMultiplier) {
         List<String> errors           = new ArrayList<>();
         int          successCount     = 0;
         boolean      wasCanceled      = false;
 
-        // --- Process files ---
-        for (File file : files) {
-            if (!shreddingActive) { wasCanceled = true; break; }
+        try {
+            // --- Process files ---
+            for (File file : files) {
+                if (!shreddingActive) { wasCanceled = true; break; }
 
-            try {
-                if (!file.exists())   { errors.add("Not found: "        + file.getName()); continue; }
-                if (!file.canWrite()) { errors.add("Skipped (read-only): " + file.getName()); continue; }
+                try {
+                    if (!file.exists())   { errors.add("Not found: "        + file.getName()); continue; }
+                    if (!file.canWrite()) { errors.add("Skipped (read-only): " + file.getName());
+                                            totalBytes -= file.length() * (long) passMultiplier; continue; }
 
-                shredFile(file, algo);
+                    shredFile(file, algo, passMultiplier);
 
-                if (algo.requiresZeroVerification) verifyZeroFill(file);
+                    if (algo.requiresZeroVerification) verifyZeroFill(file);
 
-                // Scrub metadata and rename before deletion to frustrate name-based recovery
-                File scrubbed = scrubFilename(file);
-                scrubMetadata(scrubbed);
+                    // Canceled mid-file: the overwrite is incomplete, so leave the
+                    // file in place instead of destroying or mislabeling it
+                    if (!shreddingActive) {
+                        errors.add("Canceled during shred, file left in place: " + file.getName());
+                        wasCanceled = true;
+                        break;
+                    }
 
-                if (algo != ShredAlgorithm.CRYPTO_ERASE) {
-                    if (deleteFilePermanently(scrubbed)) {
+                    if (algo != ShredAlgorithm.CRYPTO_ERASE) {
+                        // Scrub metadata and rename before deletion to frustrate name-based recovery
+                        File scrubbed = scrubFilename(file);
+                        scrubMetadata(scrubbed);
+
+                        if (deleteFilePermanently(scrubbed)) {
+                            successCount++;
+                            final String name = file.getName();
+                            SwingUtilities.invokeLater(() -> showTransientMessage("Obliterated: " + name));
+                        } else {
+                            errors.add("Shredded but could not delete: " + file.getName());
+                        }
+                    } else {
+                        // Crypto erase: content unrecoverable (key is gone); the file keeps
+                        // its name and timestamps and stays on disk, as documented
                         successCount++;
                         final String name = file.getName();
-                        SwingUtilities.invokeLater(() -> showTransientMessage("Obliterated: " + name));
-                    } else {
-                        errors.add("Shredded but could not delete: " + file.getName());
+                        SwingUtilities.invokeLater(() -> showTransientMessage("Encrypted: " + name));
                     }
-                } else {
-                    // Crypto erase: content unrecoverable; file stays on disk (key is gone)
-                    successCount++;
-                    final String name = file.getName();
-                    SwingUtilities.invokeLater(() -> showTransientMessage("Encrypted: " + name));
+
+                } catch (IOException ex) {
+                    errors.add(file.getName() + ": " + ex.getMessage());
                 }
-
-            } catch (IOException ex) {
-                errors.add(file.getName() + ": " + ex.getMessage());
             }
-        }
 
-        // --- Remove empty directories (deepest first) ---
-        for (File dir : dirs) {
-            if (!shreddingActive) { wasCanceled = true; break; }
-            try {
-                File scrubbed = scrubFilename(dir);
-                scrubMetadata(scrubbed);
-                if (deleteFilePermanently(scrubbed)) {
-                    successCount++;
-                } else {
-                    errors.add("Could not remove directory: " + dir.getAbsolutePath());
+            // --- Remove empty directories (deepest first) ---
+            for (File dir : dirs) {
+                if (!shreddingActive) { wasCanceled = true; break; }
+                try {
+                    File scrubbed = scrubFilename(dir);
+                    scrubMetadata(scrubbed);
+                    if (deleteFilePermanently(scrubbed)) {
+                        successCount++;
+                    } else {
+                        errors.add("Could not remove directory: " + dir.getAbsolutePath());
+                    }
+                } catch (IOException ex) {
+                    errors.add("Directory error " + dir.getName() + ": " + ex.getMessage());
                 }
-            } catch (IOException ex) {
-                errors.add("Directory error " + dir.getName() + ": " + ex.getMessage());
             }
+
+            if (!wasCanceled && !shreddingActive) wasCanceled = true;
+
+        } finally {
+            final int          finalSuccess  = successCount;
+            final int          finalTotal    = files.size() + dirs.size();
+            final boolean      finalCanceled = wasCanceled;
+            final List<String> finalErrors   = new ArrayList<>(errors);
+
+            shreddingActive = false;
+            SwingUtilities.invokeLater(() -> {
+                selectedFiles.clear();
+                filePathLabel.setText("No files selected.");
+                browseButton.setEnabled(true);
+                shredButton .setEnabled(true);
+                cancelButton.setEnabled(false);
+                showFinalReport(finalErrors, finalSuccess, finalTotal, finalCanceled);
+            });
         }
-
-        if (!wasCanceled && !shreddingActive) wasCanceled = true;
-
-        final int          finalSuccess  = successCount;
-        final int          finalTotal    = files.size() + dirs.size();
-        final boolean      finalCanceled = wasCanceled;
-        final List<String> finalErrors   = new ArrayList<>(errors);
-
-        shreddingActive = false;
-        SwingUtilities.invokeLater(() -> {
-            selectedFiles.clear();
-            filePathLabel.setText("No files selected.");
-            browseButton.setEnabled(true);
-            shredButton .setEnabled(true);
-            cancelButton.setEnabled(false);
-            showFinalReport(finalErrors, finalSuccess, finalTotal, finalCanceled);
-        });
     }
 
     private int getTotalPasses(ShredAlgorithm algo) {
@@ -453,7 +473,7 @@ public class DataShredderV3 extends JFrame {
     // Shred dispatch
     // -------------------------------------------------------------------------
 
-    private void shredFile(File file, ShredAlgorithm algo) throws IOException {
+    private void shredFile(File file, ShredAlgorithm algo, int randomPasses) throws IOException {
         if (!file.exists()) throw new IOException("File does not exist.");
 
         final long fileSize = file.length();
@@ -469,8 +489,7 @@ public class DataShredderV3 extends JFrame {
 
             switch (algo) {
                 case RANDOM:
-                    int passes = (Integer) passesSpinner.getValue();
-                    for (int i = 0; i < passes && shreddingActive; i++) {
+                    for (int i = 0; i < randomPasses && shreddingActive; i++) {
                         overwriteRandom(raf, buffer, fileSize);
                     }
                     break;
@@ -778,7 +797,12 @@ public class DataShredderV3 extends JFrame {
         }
 
         if (totalBytes <= 0) return;
-        long   pct = (processedBytes * 100L) / totalBytes;
+        long pct = (processedBytes * 100L) / totalBytes;
+        long now = System.currentTimeMillis();
+        // Throttle EDT posts: one per percent step or per 100 ms, whichever comes first
+        if (pct == lastPostedPct && now - lastPostedAtMs < 100) return;
+        lastPostedPct  = pct;
+        lastPostedAtMs = now;
         String eta = (averageSpeedKBs > 0)
                 ? formatTime((totalBytes - processedBytes) / (averageSpeedKBs * 1024.0))
                 : "--:--:--";

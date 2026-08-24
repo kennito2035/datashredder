@@ -1,4 +1,4 @@
-# DataShredder v3.0.0
+# DataShredder v3.0.1
 
 A full-featured Java Swing file and directory shredder with cryptographic erase, filename scrubbing, metadata scrubbing, dark-mode theming, and live ETA. Requires Java 11 or later.
 
