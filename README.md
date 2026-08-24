@@ -1,4 +1,4 @@
-# DataShredder v1.0.0
+# DataShredder v1.0.1
 
 A minimal Java Swing desktop application that permanently destroys files by overwriting them with cryptographically random data before deletion.
 
@@ -64,11 +64,10 @@ The 64 KB write buffer (`BUFFER_SIZE = 65536`) balances memory usage against I/O
 
 ## Limitations
 
-- **Files only** — directories cannot be selected or processed.
+- **Files only** — directories cannot be selected or processed; recursive shredding of folder trees is not supported.
 - **Single algorithm** — only random-data overwrite is available; no DoD, Gutmann, or zero-fill modes.
 - **No cancel button** — once shredding starts it cannot be stopped mid-run (closing the window prompts a confirmation).
 - **No ETA** — the progress bar shows percentage only, not time remaining.
-- **No directory support** — recursive shredding of folder trees is not supported.
 - **No symbolic-link guard at selection time** — symbolic links are filtered during shredding, not during file selection.
 - **SSD caveat** — like all software-based shredders, this tool cannot guarantee physical erasure on SSDs or drives with hardware-level wear leveling. Use manufacturer firmware tools (e.g., ATA Secure Erase) for those.
 

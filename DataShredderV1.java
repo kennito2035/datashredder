@@ -1,5 +1,5 @@
 /**
- * DataShredder v1.0.0
+ * DataShredder v1.0.1
  *
  * Simple file shredder: random-data overwrite with a configurable number of passes.
  */
@@ -34,6 +34,10 @@ public class DataShredderV1 extends JFrame {
     private final List<File> selectedFiles = new ArrayList<>();
     private volatile boolean shreddingActive = false;
 
+    // Progress-throttle state; touched only by the single worker thread
+    private int  lastPostedPct  = -1;
+    private long lastPostedAtMs = 0;
+
     // -------------------------------------------------------------------------
     // Construction
     // -------------------------------------------------------------------------
@@ -49,7 +53,7 @@ public class DataShredderV1 extends JFrame {
     // -------------------------------------------------------------------------
 
     private void initializeUI() {
-        setTitle("File Shredder v1.0.0");
+        setTitle("File Shredder v1.0.1");
         setSize(585, 240);
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         setLayout(new FlowLayout(FlowLayout.LEFT, 10, 10));
@@ -150,9 +154,12 @@ public class DataShredderV1 extends JFrame {
         int successCount       = 0;
         int totalFiles         = files.size();
 
-        // Pre-calculate total byte work for smooth progress reporting
+        // Pre-calculate total byte work for smooth progress reporting.
+        // Files the loop below will skip are excluded so the bar can reach 100%.
         long totalBytes = 0;
-        for (File f : files) totalBytes += f.length();
+        for (File f : files) {
+            if (f.canWrite() && !Files.isSymbolicLink(f.toPath())) totalBytes += f.length();
+        }
         totalBytes *= passes;
 
         // Mutable counter wrapped to satisfy lambda capture rules
@@ -262,6 +269,11 @@ public class DataShredderV1 extends JFrame {
     private void updateProgressBar(long totalBytes, long processedBytes) {
         if (totalBytes <= 0) return;
         int pct = (int) Math.min(100, (processedBytes * 100L) / totalBytes);
+        long now = System.currentTimeMillis();
+        // Throttle EDT posts: one per percent step or per 100 ms, whichever comes first
+        if (pct == lastPostedPct && now - lastPostedAtMs < 100) return;
+        lastPostedPct  = pct;
+        lastPostedAtMs = now;
         SwingUtilities.invokeLater(() -> {
             progressBar.setValue(pct);
             progressBar.setString(pct + "%");
