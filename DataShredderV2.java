@@ -1,5 +1,5 @@
 /**
- * DataShredder v2.0.0
+ * DataShredder v2.0.1
  *
  * Multi-algorithm file/directory shredder with cancel and ETA.
  *
@@ -80,6 +80,10 @@ public class DataShredderV2 extends JFrame {
     private volatile long     startTimeMs      = 0;
     private volatile double   averageSpeedKBs  = 0; // KB per second
 
+    // Progress-throttle state; guarded by the synchronized recordProgress
+    private long lastPostedPct  = -1;
+    private long lastPostedAtMs = 0;
+
     // -------------------------------------------------------------------------
     // Construction
     // -------------------------------------------------------------------------
@@ -96,7 +100,7 @@ public class DataShredderV2 extends JFrame {
     // -------------------------------------------------------------------------
 
     private void initializeUI() {
-        setTitle("File Shredder v2.0.0");
+        setTitle("File Shredder v2.0.1");
         setSize(700, 300);
         setResizable(false);
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
@@ -254,6 +258,8 @@ public class DataShredderV2 extends JFrame {
         if (confirm != JOptionPane.YES_OPTION) return;
 
         ShredAlgorithm algo = (ShredAlgorithm) algorithmComboBox.getSelectedItem();
+        // Captured on the EDT; the worker must not touch the Swing spinner
+        int passMultiplier  = getTotalPasses(algo);
 
         shreddingActive = true;
         shredButton .setEnabled(false);
@@ -264,13 +270,15 @@ public class DataShredderV2 extends JFrame {
         startTimeMs     = System.currentTimeMillis();
         averageSpeedKBs = 0;
 
-        totalBytes     = filesToProcess.stream().mapToLong(File::length).sum() * getTotalPasses(algo);
+        totalBytes     = filesToProcess.stream().mapToLong(File::length).sum() * passMultiplier;
         processedBytes = 0;
+        lastPostedPct  = -1;
+        lastPostedAtMs = 0;
 
-        new Thread(() -> runShredding(filesToProcess, algo), "shredder-thread").start();
+        new Thread(() -> runShredding(filesToProcess, algo, passMultiplier), "shredder-thread").start();
     }
 
-    private void runShredding(List<File> files, ShredAlgorithm algo) {
+    private void runShredding(List<File> files, ShredAlgorithm algo, int passMultiplier) {
         List<String> errors    = new ArrayList<>();
         int successCount       = 0;
         boolean wasCanceled    = false;
@@ -284,16 +292,26 @@ public class DataShredderV2 extends JFrame {
                         errors.add("Not found: " + file.getName()); continue;
                     }
                     if (!file.canWrite()) {
-                        errors.add("Skipped (read-only): " + file.getName()); continue;
+                        errors.add("Skipped (read-only): " + file.getName());
+                        totalBytes -= file.length() * (long) passMultiplier; continue;
                     }
                     if (Files.isSymbolicLink(file.toPath())) {
-                        errors.add("Skipped (symbolic link): " + file.getName()); continue;
+                        errors.add("Skipped (symbolic link): " + file.getName());
+                        totalBytes -= file.length() * (long) passMultiplier; continue;
                     }
 
-                    shredFile(file, algo);
+                    shredFile(file, algo, passMultiplier);
 
                     if (algo.requiresZeroVerification) {
                         verifyZeroFill(file);
+                    }
+
+                    // Canceled mid-file: the overwrite is incomplete, so leave the
+                    // file in place instead of deleting it and calling it a success
+                    if (!shreddingActive) {
+                        errors.add("Canceled during shred, file left in place: " + file.getName());
+                        wasCanceled = true;
+                        break;
                     }
 
                     boolean deleted = deleteFilePermanently(file);
@@ -344,7 +362,7 @@ public class DataShredderV2 extends JFrame {
     // Shred dispatch
     // -------------------------------------------------------------------------
 
-    private void shredFile(File file, ShredAlgorithm algo) throws IOException {
+    private void shredFile(File file, ShredAlgorithm algo, int randomPasses) throws IOException {
         if (!file.exists()) throw new IOException("File does not exist.");
         if (file.length() == 0) return; // nothing to overwrite in an empty file
 
@@ -359,8 +377,7 @@ public class DataShredderV2 extends JFrame {
 
             switch (algo) {
                 case RANDOM:
-                    int passes = (Integer) passesSpinner.getValue();
-                    for (int i = 0; i < passes && shreddingActive; i++) {
+                    for (int i = 0; i < randomPasses && shreddingActive; i++) {
                         overwriteRandom(raf, buffer, fileSize);
                     }
                     break;
@@ -587,6 +604,11 @@ public class DataShredderV2 extends JFrame {
 
         if (totalBytes <= 0) return;
         long pct = (processedBytes * 100L) / totalBytes;
+        long now = System.currentTimeMillis();
+        // Throttle EDT posts: one per percent step or per 100 ms, whichever comes first
+        if (pct == lastPostedPct && now - lastPostedAtMs < 100) return;
+        lastPostedPct  = pct;
+        lastPostedAtMs = now;
         // Guard against divide-by-zero: only compute ETA once speed is established
         String eta = (averageSpeedKBs > 0)
                 ? formatTime((totalBytes - processedBytes) / (averageSpeedKBs * 1024.0))

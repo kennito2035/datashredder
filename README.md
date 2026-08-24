@@ -1,4 +1,4 @@
-# DataShredder v2.0.0
+# DataShredder v2.0.1
 
 A multi-algorithm Java Swing file and directory shredder with cancellation support, live ETA tracking, and file-locking to prevent concurrent access.
 
