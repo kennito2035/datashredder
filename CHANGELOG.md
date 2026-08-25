@@ -1,5 +1,13 @@
 # Changelog — DataShredder v3
 
+## v3.0.2 (2026-08-25)
+
+### Bug Fixes
+
+- **File chooser labels readable in dark mode.** The "File name:" and "Files of type:" labels rendered black on the dark panel background and were nearly invisible. They are now recolored white individually; the global `Label.foreground` key stays black because the look and feel draws the "Look in:" label on a light strip where white text would be unreadable.
+
+---
+
 ## v3.0.1 (2026-08-25)
 
 ### Bug Fixes

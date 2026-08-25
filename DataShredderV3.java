@@ -1,5 +1,5 @@
 /**
- * DataShredder v3.0.1
+ * DataShredder v3.0.2
  *
  * Full-featured file/directory shredder with crypto erase, filename scrubbing,
  * metadata scrubbing, dark-mode theming, and live ETA.
@@ -130,7 +130,7 @@ public class DataShredderV3 extends JFrame {
     // -------------------------------------------------------------------------
 
     private void initializeUI() {
-        setTitle("Data Shredder v3.0.1");
+        setTitle("Data Shredder v3.0.2");
         setSize(700, 300);
         setResizable(false);
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
@@ -268,12 +268,35 @@ public class DataShredderV3 extends JFrame {
         chooser.setMultiSelectionEnabled(true);
         chooser.setFileSelectionMode(JFileChooser.FILES_AND_DIRECTORIES);
 
+        if (isDarkModeEnabled()) applyChooserLabelColors(chooser);
+
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
             selectedFiles.clear();
             for (File f : chooser.getSelectedFiles()) {
                 if (f.exists() && !Files.isSymbolicLink(f.toPath())) selectedFiles.add(f);
             }
             updateFilePathLabel();
+        }
+    }
+
+    /**
+     * Recolors the file chooser's "File name:" and "Files of type:" labels,
+     * which sit on the dark panel background. A global white Label.foreground
+     * cannot be used instead: the LAF renders the "Look in:" label on a light
+     * strip, where white text would be unreadable.
+     */
+    private void applyChooserLabelColors(Container container) {
+        String fileName = UIManager.getString("FileChooser.fileNameLabelText");
+        String fileType = UIManager.getString("FileChooser.filesOfTypeLabelText");
+        for (Component comp : container.getComponents()) {
+            if (comp instanceof JLabel) {
+                String text = ((JLabel) comp).getText();
+                if (text != null && (text.equals(fileName) || text.equals(fileType))) {
+                    comp.setForeground(Color.WHITE);
+                }
+            } else if (comp instanceof Container) {
+                applyChooserLabelColors((Container) comp);
+            }
         }
     }
 
