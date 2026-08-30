@@ -1,5 +1,5 @@
 /**
- * DataShredder v4.0.0
+ * DataShredder v4.0.1
  *
  * File and directory shredder with a queue UI, per-item and overall progress,
  * pause/resume, free-space wiping, an opt-in erasure report and a headless CLI.
@@ -70,7 +70,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class DataShredderV4 {
 
     static final String APP_NAME    = "Data Shredder";
-    static final String APP_VERSION = "v4.0.0";
+    static final String APP_VERSION = "v4.0.1";
 
     private DataShredderV4() { }
 
@@ -1951,6 +1951,35 @@ public class DataShredderV4 {
             }
         }
 
+        /**
+         * Dark styling the palette cannot deliver through UIManager keys: the
+         * Windows look and feel paints table headers itself and ignores the
+         * TableHeader colour keys, so the header gets an explicit renderer.
+         * The scroll pane's viewport is matched to the table surface so the
+         * area past the table never flashes light.
+         */
+        private void styleTableDark(JScrollPane scroll) {
+            final Color headerBg   = new Color(64, 64, 64);
+            final Color headerLine = new Color(110, 110, 110);
+            javax.swing.table.JTableHeader header = table.getTableHeader();
+            header.setDefaultRenderer(new javax.swing.table.DefaultTableCellRenderer() {
+                private static final long serialVersionUID = 4006L;
+                @Override public Component getTableCellRendererComponent(
+                        JTable t, Object value, boolean selected, boolean focused, int row, int column) {
+                    super.getTableCellRendererComponent(t, value, selected, focused, row, column);
+                    setBackground(headerBg);
+                    setForeground(Color.WHITE);
+                    setOpaque(true);
+                    setBorder(BorderFactory.createCompoundBorder(
+                            BorderFactory.createMatteBorder(0, 0, 1, 1, headerLine),
+                            BorderFactory.createEmptyBorder(2, 6, 2, 6)));
+                    return this;
+                }
+            });
+            header.setBackground(headerBg);
+            scroll.getViewport().setBackground(table.getBackground());
+        }
+
         // ---------------------------------------------------------------------
         // Fields
         // ---------------------------------------------------------------------
@@ -2068,6 +2097,8 @@ public class DataShredderV4 {
             queueBorder.setTitleColor(labelFg);
             scroll.setBorder(queueBorder);
             add(scroll, BorderLayout.CENTER);
+
+            if (darkMode) styleTableDark(scroll);
 
             // --- Buttons and progress ---
             JPanel bottom = new JPanel(new BorderLayout(6, 6));

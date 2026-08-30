@@ -1,5 +1,13 @@
 # Changelog - DataShredder v4
 
+## v4.0.1 (2026-08-30)
+
+### Bug Fixes
+
+- **Queue table fully themed in dark mode.** The Windows look and feel paints table headers itself and ignores the TableHeader colour keys, so the header row stayed light while everything around it was dark. The header now uses an explicit renderer (dark background, white text, thin separator lines), and the scroll pane viewport is matched to the table surface so the area past the table stays dark too. Light mode is untouched.
+
+---
+
 ## v4.0.0 (2026-08-30)
 
 All changes relative to **v3.0.2**. The source file `DataShredderV3.java` is replaced by

@@ -1,4 +1,4 @@
-# DataShredder v4.0.0
+# DataShredder v4.0.1
 
 A Java file and directory shredder with a queue interface, per-item and overall progress, pause and resume, free-space wiping, an opt-in erasure report, and a headless command line mode. Six overwrite algorithms including ChaCha20 cryptographic erase. Zero external dependencies. Requires Java 11 or later.
 
