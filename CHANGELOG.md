@@ -1,102 +1,240 @@
-# Changelog — DataShredder v3
+# Changelog - DataShredder v4
 
-## v3.0.2 (2026-08-25)
+## v4.0.0 (2026-08-30)
 
-### Bug Fixes
-
-- **File chooser labels readable in dark mode.** The "File name:" and "Files of type:" labels rendered black on the dark panel background and were nearly invisible. They are now recolored white individually; the global `Label.foreground` key stays black because the look and feel draws the "Look in:" label on a light strip where white text would be unreadable.
-
----
-
-## v3.0.1 (2026-08-25)
-
-### Bug Fixes
-
-- **Canceling no longer destroys the file being processed.** When cancellation arrived mid-file, the partially overwritten file was still renamed, timestamp-scrubbed, deleted, and counted as a success; after a partial crypto erase it was reported as "Encrypted". The worker now stops before any follow-up action, leaves the file in place, and reports it as canceled.
-- **CRYPTO_ERASE keeps the filename and timestamps.** Documented behaviour is that the encrypted file stays on disk with its directory metadata intact, but the code also renamed it three times and reset its timestamps, which made the documented follow-up (a second pass with a destructive algorithm) impossible to target. Filename and metadata scrubbing now run only for algorithms that delete the file.
-- **UI reset restored to a `finally` block.** v3.0.0 re-enabled the buttons inline after the loops, so an unexpected runtime error could leave the window permanently disabled with shredding flagged active. The reset is back inside a `finally` block, as in v1 and v2.
-- **Pass count captured on the UI thread.** RANDOM mode read the passes spinner from the background worker thread; the value is now captured before the worker starts and passed through.
-- **Progress bar can reach 100% when files are skipped.** Files skipped as read-only are now subtracted from the total byte estimate instead of leaving the bar stuck below 100%.
-- **Progress updates throttled.** Progress now posts to the event dispatch thread only when the percentage changes or 100 ms have passed since the last post.
-
----
-
-## v3.0.0
-
-All changes relative to **v2.0.0**.
+All changes relative to **v3.0.2**. The source file `DataShredderV3.java` is replaced by
+`DataShredderV4.java`, and a runnable engine test, `DataShredderV4EngineTest.java`, ships
+alongside it. Zero external dependencies and a Java 11 minimum are unchanged.
 
 ---
 
 ### New Features
 
-#### ChaCha20 cryptographic erase (`CRYPTO_ERASE`)
-A sixth algorithm was added that encrypts the file in-place using ChaCha20 (standard JCA, Java 11+, no third-party library). A 256-bit key and 96-bit nonce are generated with `SecureRandom`, used to stream-encrypt the file chunk by chunk via `Cipher.update()` / `Cipher.doFinal()`, and then immediately zeroed in a `finally` block with `Arrays.fill`. Without the key, the ciphertext is computationally indistinguishable from random noise.
+#### File queue with a table UI
 
-Unlike every other algorithm, CRYPTO_ERASE does **not** delete the file after encryption — the content is already unrecoverable.
+The window no longer works on one selection at a time. Selected files and folders become rows
+in a `JTable` with three columns: Name (tooltip shows the full path), Size ("12.3 MB" for a
+file, "folder" for a directory) and Status, which moves from "Queued" through "Working: <name>"
+to a per row outcome (Done, Done (crypto erased), Partial with counts, Skipped, Failed with the
+reason, or Canceled). Rows that finished cleanly are removed when the run ends; anything the
+user still needs to see stays on screen.
 
-> This replaces a broken Kyber implementation from an earlier branch that cast a JCA `PublicKey` to `KyberPublicKeyParameters` (causing `ClassCastException`), mixed raw and JCA API usage, and required a BouncyCastle PQC dependency that was never included.
+Queue management is done with Add, Remove Selected and Clear. The window is resizable with a
+minimum size of 720 by 480; v3's window was fixed.
 
-#### Filename scrubbing
-Before deletion, `scrubFilename()` performs three sequential `Files.move()` renames to randomly generated names. `ATOMIC_MOVE` is requested first; a non-atomic fallback is used if the file system does not support it. Overwriting the directory entry multiple times frustrates inode-level name recovery.
+#### Drag and drop
 
-> Fixed from a prior version where a dummy file was created at the destination path, the real file was moved onto it with `ATOMIC_MOVE`, and then `currentPath` was deleted — deleting the file that had just been moved. The method now does a pure rename chain with no dummy file.
+A `TransferHandler` accepting `DataFlavor.javaFileListFlavor` is installed on both the table and
+the frame, so files can be dropped anywhere on the window. `setFillsViewportHeight(true)` makes
+drops below the last row land on the table rather than on the viewport behind it. Drops are
+refused while a run is in progress. Windows blocks Explorer to application drops when the
+application runs elevated, so the Add button remains the fallback.
 
-#### Metadata scrubbing
-After filename scrubbing, `scrubMetadata()` sets all three file timestamps (creation, last-modified, last-access) to `FileTime.fromMillis(0)` (Unix epoch) via `BasicFileAttributeView`. Failures are silently ignored since not all file systems support all timestamp fields.
+#### Per item and overall progress bars with ETA
 
-#### Post-shred directory deletion
-`collectDirectories()` enumerates all sub-directories of selected inputs and sorts them by absolute-path length descending, ensuring deepest children are processed before their parents. After all files are shredded, each directory is scrubbed and deleted in this order.
+Two bars replace v3's single bar and its transient per file messages. The upper bar tracks the
+file currently being written; the lower bar tracks the run, labelled `X% - HH:MM:SS remaining`.
+Speed and the estimate are computed from `getActiveElapsedMillis()`, which subtracts paused
+time, so pausing does not inflate the remaining estimate. When the byte total cannot be
+determined the bar switches to indeterminate instead of showing a wrong percentage.
 
-#### Dark mode theming
-`isDarkModeEnabled()` returns `true` (hardcoded). When enabled, `main()` applies a full `UIManager` colour palette covering panels, labels, buttons, combo boxes, spinners, option panes, and formatted text fields. A comment in the method explains how to replace the hardcoded value with automatic OS-level detection using `com.jthemedetecor`.
+#### Pause and resume
 
-#### Transient per-file progress messages
-`showTransientMessage()` temporarily replaces the ETA string on the progress bar with a per-file status ("Obliterated: …" / "Encrypted: …"), then reverts to the ETA display after 2.5 seconds using a non-repeating `javax.swing.Timer`. A `stopMessageTimer()` guard prevents overlapping timers.
+A Pause/Resume button is enabled while a run is in progress. The engine parks between chunk
+writes in `checkpoint()`, using a `wait`/`notifyAll` loop that re-tests both the pause and the
+cancel flag, so it is safe against spurious wakeups and against a cancel that arrives while
+paused. Cancel still works while paused, and returns promptly.
 
-> Fixed from a prior version where the timer rescheduled itself on every fire, creating an unbounded chain of nested timers.
+A paused run holds the exclusive file lock on the file it stopped inside, and during a free
+space wipe it holds the disk it has filled so far, until it is resumed or canceled.
 
-#### Progress bar colour feedback
-The progress bar changes colour to reflect state: **green** while shredding, **red** on cancel, **grey** when idle or after reset. A `resetTimer` (non-repeating, 3 s) restores the idle appearance after cancellation or completion.
+#### Free space wipe
 
-#### Spinner input validation
-`NumberFormatter.setAllowsInvalid(false)` is applied to the passes spinner's editor, blocking any non-numeric characters from being typed.
+A Wipe Free Space button (CLI: `--wipe-free <dir>`) fills the free space of the volume holding a
+chosen folder with a single random pass and then releases it, so previously deleted file content
+is overwritten. Work happens in a `wipe-<random>` sub folder of the picked folder, which avoids
+the permission problems of writing at a drive root. Files are written up to 1 GiB each in 1 MiB
+`SecureRandom` chunks and synced per file.
 
-#### 1 MB write buffer
-`BUFFER_SIZE` increased from 65 536 bytes (64 KB) to 1 048 576 bytes (1 MB), reducing I/O overhead on modern drives with large sector sizes and write-combining hardware.
+The fill stops when the byte limit is reached, when usable space is reported above zero but below
+1 MiB, or on an `IOException` raised after at least one chunk was written successfully. A reported
+zero is read as unknown rather than as a full volume, because some network and substituted volumes
+return it, and treating it as full would stop the fill before a single byte was written. Java
+exposes no portable out of space error code, so a failure on the very first chunk is treated as a
+real error and reported as one. A run that writes nothing at all is reported as failed rather than
+as a success.
+
+Cleanup runs in a `finally` block, including after a cancel, and every delete is checked. Wipe
+files that could not be removed are named in the result line, with the total size they are still
+occupying, so the outcome never claims disk space was given back when it was not. Files and the
+working folder are also registered with `deleteOnExit()`.
+
+The confirmation dialog states that the disk briefly reads as full, that other programs may fail
+to write, that a cloud synced folder would make the sync client upload the random data, and that
+`wipe-*` leftovers remain if the program is killed part way. The wipe is single pass random only.
+
+#### Headless command line mode
+
+Running the jar with arguments runs headless and never touches Swing:
+
+```
+java -jar DataShredderV4.jar --algo <random|dod3|gutmann|zero|nvme|crypto> [--passes N] [--report <path>] --yes <paths...>
+java -jar DataShredderV4.jar --wipe-free <dir> [--limit <MB>] [--report <path>] --yes
+java -jar DataShredderV4.jar --help
+```
+
+Without `--yes` the command prints what would be destroyed and exits 2 without touching
+anything. Exit codes are 0 for a clean run, 1 when items failed, 2 for a usage error or a
+refused run. Progress prints at item boundaries and every 5 percent. `--limit` is bounds checked
+so the megabytes to bytes multiplication cannot overflow into a negative value, which the engine
+would otherwise read as "no limit" and turn a capped wipe into a full volume fill.
+
+Running with no arguments at all still starts the graphical interface.
+
+#### Opt in erasure report
+
+A "Write erasure report" checkbox (CLI: `--report <path>`) produces a plain text record of the
+run: tool and version, timestamp, mode, algorithm, pass count, total bytes processed, and one
+block per queue item giving the absolute path, size and outcome with per file counts. The footer
+repeats the flash storage caveat. In the GUI the report is offered through a save dialog when the
+run finishes; in the CLI it is written to the given path.
+
+The report is off by default because it lists the names and paths of destroyed files. When a
+report was asked for and could not be written, the CLI says so and exits non-zero, so a script
+collecting audit evidence cannot read the run as a success.
+
+#### Automatic dark mode detection
+
+`isDarkModeEnabled()` replaces v3's hardcoded `true`. On Windows it reads
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme` through
+`reg query`, draining the child's output on a daemon thread and bounding the wait at two seconds
+with `destroyForcibly()` on timeout; `0x0` means dark. Any other platform, and any failure,
+means light. The system property `datashredder.theme=dark|light` overrides the probe. Detection
+is called only from the GUI launch path, never from a static initializer, so the headless path
+never runs it.
 
 ---
 
-### Bug Fixes
+### Changes
 
-#### `scrubFilename` no longer deletes the file being renamed
-The prior implementation created a dummy file at the rename target, moved the real file onto it with `ATOMIC_MOVE`, then deleted `currentPath` — which was now pointing at the file that had just been moved away. The fix uses a plain rename chain: `current → next → next → next`, with no dummy file created at any step.
+#### Structure: engine, CLI and UI split
 
-#### Progress bar no longer updates when canceled
-`recordProgress()` now checks `shreddingActive` before posting to the EDT, preventing stale percentage updates from appearing after the user cancels.
+`DataShredderV4` is a plain class holding only `main()` and nested static classes:
+`ShredEngine` (no Swing or AWT usage at all), `Cli`, `Gui` and `ItemResult`. It deliberately
+does not extend `JFrame`, because subclassing a Swing type would force AWT class initialisation
+even on the headless CLI path. All Swing lives in `Gui`.
 
-#### Timer leak eliminated
-The self-rescheduling progress timer from a prior version has been replaced with direct `SwingUtilities.invokeLater` calls from `recordProgress()`, with a separate non-repeating `messageTimer` for transient messages only.
+The engine reports through a `Listener` interface (`onTotalBytes`, `onProgress`, `onFileStart`,
+`onFileProgress`, `onItemResult`, `onFinished`). Every callback fires on the engine's worker
+thread; the GUI adapter marshals to the event dispatch thread and throttles the two progress
+callbacks to one post per percent step or per 100 ms, before `invokeLater`, so the event queue
+never floods.
 
-#### `Files.walk` stream leak (carried from v2, confirmed closed)
-`collectFiles()` and the new `collectDirectories()` both use try-with-resources to guarantee the `Stream<Path>` is closed on any exit path.
+#### Symbolic links and NTFS junctions are never followed
 
----
+v3 excluded symbolic links only. `Files.isSymbolicLink` returns false for a directory junction
+made with `mklink /J`, so a plain walk would have entered it and shredded files far outside the
+selected folder; junctions exist in every Windows user profile by default. `isLinkOrJunction()`
+now compares where a directory resolves to against where it sits, resolving the parent for real
+as well so that an ancestor junction, a substituted drive letter or a differently cased path
+does not make ordinary entries look redirected. Redirected entries are skipped by the queue, by
+the file walk and by the directory walk, and are left exactly as they were found.
 
-### UI Changes
+#### Directory scans survive unreadable entries
 
-- Progress bar text colour forced to black on both themes via a custom `BasicProgressBarUI` subclass overriding `getSelectionForeground` / `getSelectionBackground`.
-- Progress bar foreground is green during shredding, red on cancel, grey when idle.
-- Transient "Obliterated: …" / "Encrypted: …" labels flash per file, reverting to ETA after 2.5 s.
-- Result dialog is **non-modal** on a clean run so the `resetTimer` can still fire behind it; remains modal when there are errors or a cancellation.
-- Cancel button turns the progress bar red and schedules a 3-second visual reset.
-- Window title changed from **"File Shredder v2.0.0"** to **"Data Shredder v3.0.0"**.
-- `showFinalReport()` calls `stopMessageTimer()` before displaying the dialog to avoid a stale message overwriting the final result string.
+`collectFiles()` and `collectDirectories()` moved from `Files.walk` to `walkFileTree` with a
+visitor that records an unreadable entry and carries on. The previous behaviour let a single
+ACL restricted subfolder, a System Volume Information directory or a folder locked by another
+process abort the whole scan and leave every readable file in the tree untouched. Recorded scan
+problems are counted against their own row and appear in its status text and in the report.
+Both walks also honour pause and cancel, so a scan of a large tree can be stopped.
 
----
+#### Queue entries are de-duplicated
 
-### Internal / Non-Visible Changes
+The expanded file list is de-duplicated by canonical path, so a queue holding both a folder and a
+file inside it processes that file exactly once instead of shredding it twice and then reporting
+"Not found" for the second attempt. The first row to claim a path keeps it; the later row is
+reported as skipped.
 
-- `main()` moved `UIManager.setLookAndFeel` and dark-mode setup outside `invokeLater` so the palette is applied before any Swing component is created.
-- `runShredding` is split into a files loop and a separate directories loop, both inside a single method (no longer uses a `finally` block for UI reset — reset is done inline after both loops complete).
-- `getTotalPasses` updated to handle `CRYPTO_ERASE` returning `1`; the progress multiplier in `startShreddingProcess` is capped at `1` for `CRYPTO_ERASE` regardless.
-- `generateRandomName` generates names of variable length (8–16 characters) instead of a fixed 12 characters.
+#### Per item outcomes replace a single run summary
+
+`ItemResult` carries a kind plus files done, skipped and failed counts and a detail string. Row
+status precedence is: any failure gives FAILED, otherwise any skip with nothing done gives
+SKIPPED, any skip with work done gives PARTIAL, and a clean row gives SHREDDED or CRYPTO_ERASED.
+This is what makes a partly successful folder legible, which v3's single end of run dialog could
+not express.
+
+#### Non-empty directories are kept, not renamed
+
+Directories are still processed deepest first, but a directory that still has children is left
+alone with its name intact and recorded as a skip. Its remaining children are always things the
+run was never going to remove: a link or junction that is not followed, a read only file skipped
+on purpose, or an entry whose own failure was already counted with its own note. Renaming such a
+directory would hide those leftovers under a random string and the report would then name a
+directory that no longer exists. Counting it as a failure would make a correct run exit non-zero.
+
+#### Overlapping file locks are caught
+
+The per item catch is `catch (IOException | OverlappingFileLockException ex)`. `tryLock` throws
+the latter unchecked, and a queue holding both a folder and a file inside it makes a same JVM
+overlap reachable.
+
+#### Invalid paths fail their own row only
+
+`File.toPath()` rejects characters the platform does not allow in a path with an unchecked
+`InvalidPathException`. It is now caught per row, so an argument such as `report<1>.txt` no
+longer unwinds out of the whole run and leaves every other queued item untouched.
+
+#### A file that was overwritten but could not be deleted says where it is
+
+Such a file no longer carries its original name anywhere on disk, because filename scrubbing has
+already renamed it. The note now gives both the original name and the absolute path the file
+currently sits at.
+
+#### Cancel is checked after the final pass
+
+The write loops check only between chunks, so a cancel arriving during the final chunk of the
+final pass previously fell straight through to the rename, the timestamp scrub and the delete.
+A checkpoint after the passes and the zero-fill verification closes that window: a cancel means
+the file stays where it is, whichever chunk it landed on.
+
+#### Cancel confirmation re-checks the run
+
+The cancel confirmation dialog runs a nested event loop, so the run can finish while it is open.
+The engine reference and the running flag are re-checked after the dialog closes, so a run that
+already completed is not left showing a red "Canceling..." over destroyed files with nothing to
+replace it.
+
+#### Progress text is not painted over by in flight posts
+
+The UI tracks whether it is running, paused or canceling. A progress post that was already in
+flight when the user paused or cancelled no longer paints an ordinary percentage over the
+sentence explaining what the run is doing. This matters most for the pause banner: once the
+worker parks in `checkpoint()` no later post would correct it.
+
+#### Transient per file messages and the reset timer are gone
+
+v3's `showTransientMessage()`, `stopMessageTimer()` and the 3 second `resetTimer` are removed.
+Their job, saying what is being worked on right now, is done by the current item bar and the
+Status column. The end of run dialog is replaced by the overall bar's final text, except for a
+free space wipe that ends partial, failed or canceled, which still raises a dialog because the
+path of a leftover wipe file does not fit in the bar.
+
+#### Dark mode palette extended
+
+The v3 palette is carried over, including the deliberate choice to leave `Label.foreground`
+dark: a global white breaks the file chooser's "Look in:" label, which the look and feel paints
+on a light strip. `applyChooserLabelColors` now also matches `FileChooser.folderNameLabelText`,
+so the directories only chooser used by the free space wipe is covered as well. Table, table
+header, scroll pane and viewport keys were added for the queue, and the "Queue" titled border
+sets its own title colour rather than going through a global key.
+
+#### Report and result wording
+
+Error text names the exception type as well as its message. A `java.nio.file.FileSystemException`
+often carries nothing but the path, and the bare message would otherwise read like a line
+announcing where the report had been written.
+
+#### Version and title
+
+The window title is now "Data Shredder v4.0.0".

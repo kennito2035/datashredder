@@ -1,0 +1,28 @@
+Step 1: Compile the application
+javac --release 11 -d ./build DataShredderV4.java
+
+Step 2: Go to build directory
+cd build
+
+Step 3: Create the executable JAR
+jar cfe DataShredderV4.jar DataShredderV4 *.class
+
+Step 4: Run the JAR (GUI)
+java -jar DataShredderV4.jar
+
+Step 5: Show contents of your JAR
+jar tf DataShredderV4.jar
+
+Step 6: Run the command line mode (example)
+java -jar DataShredderV4.jar --algo random --passes 3 --report report.txt --yes C:\temp\old-notes.txt
+
+Step 7: Show the command line help
+java -jar DataShredderV4.jar --help
+
+Step 8: Compile the test into a separate directory
+Run this from the project root, not from build.
+The test classes go to test-build so they stay out of the JAR.
+javac --release 11 -d ./test-build DataShredderV4.java DataShredderV4EngineTest.java
+
+Step 9: Run the test
+java -cp ./test-build DataShredderV4EngineTest
