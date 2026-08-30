@@ -1,5 +1,5 @@
 /**
- * DataShredder v4.0.1
+ * DataShredder v4.1.0
  *
  * File and directory shredder with a queue UI, per-item and overall progress,
  * pause/resume, free-space wiping, an opt-in erasure report and a headless CLI.
@@ -7,13 +7,21 @@
  *
  * Algorithms:
  *  - RANDOM      : Configurable passes of cryptographically random data
- *  - DOD3        : DoD 5220.22-M  (zeros -> ones -> random, correct order)
- *  - GUTMANN     : Gutmann 35-pass (deterministic order, not shuffled)
+ *  - DOD3        : The classic three-pass sequence historically attributed to
+ *                  DoD 5220.22-M (zeros -> ones -> random). The current NISPOM
+ *                  specifies no overwrite method, and this implementation does
+ *                  not verify.
+ *  - GUTMANN     : Gutmann 35-pass; the 27 deterministic patterns are randomly
+ *                  permuted per file, which is what the paper specifies.
  *  - ZERO        : Single zero-fill pass with post-write verification
- *  - NVME_PURGE  : NIST SP 800-88 4-pass ending in zeros, with verification
- *  - CRYPTO_ERASE: ChaCha20 in-place encryption; key discarded after use.
- *                  File content becomes unrecoverable without the key.
- *                  The file keeps its name, timestamps and place on disk.
+ *  - NVME_PURGE  : A 4-pass scheme of this tool's own design, ending in zeros
+ *                  with verification. Loosely motivated by the discussion in
+ *                  SP 800-88; it is not a NIST technique.
+ *  - CRYPTO_ERASE: ChaCha20 in-place encryption; the local key and nonce arrays
+ *                  are zeroed after use, but copies inside SecretKeySpec and the
+ *                  cipher's expanded key schedule stay on the JVM heap until
+ *                  garbage collection, which pure Java cannot prevent. The file
+ *                  keeps its name, timestamps and place on disk.
  *
  * Structure: this is a plain class holding only main() and nested static
  * classes. It deliberately does NOT extend JFrame, because subclassing a Swing
@@ -36,9 +44,9 @@ import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
-import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.Charset;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileVisitOption;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -57,12 +65,15 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Date;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -70,9 +81,30 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class DataShredderV4 {
 
     static final String APP_NAME    = "Data Shredder";
-    static final String APP_VERSION = "v4.0.1";
+    static final String APP_VERSION = "v4.1.0";
+
+    /**
+     * Stated at the moment of destruction, in the confirmation dialogs and the
+     * CLI, rather than only in the opt-in report footer and the README.
+     */
+    static final String FLASH_CAVEAT =
+            "On SSDs and other flash storage an overwrite may not reach every"
+            + " physical copy of the data.";
 
     private DataShredderV4() { }
+
+    /**
+     * Escapes the three characters Swing's HTML renderer treats as markup, so
+     * exception text and file paths cannot inject tags into an html label. It
+     * lives on the outer class rather than inside Gui so it can be exercised
+     * headlessly by the engine test.
+     */
+    static String escapeHtml(String s) {
+        return String.valueOf(s)
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;");
+    }
 
     /**
      * With arguments the process runs headless through {@link Cli}; without
@@ -105,27 +137,46 @@ public class DataShredderV4 {
         final int    filesFailed;
         final String detail;
 
+        /**
+         * CANCELED only: an item was part way through being destroyed when the
+         * cancel arrived, so the detail names the phase it was interrupted in.
+         * A cancel taken at one of the checkpoints between items leaves this
+         * false, and nothing is then half destroyed. Always false for every
+         * other kind.
+         */
+        final boolean itemInFlight;
+
         ItemResult(Kind kind, int filesDone, int filesSkipped, int filesFailed, String detail) {
+            this(kind, filesDone, filesSkipped, filesFailed, detail, false);
+        }
+
+        ItemResult(Kind kind, int filesDone, int filesSkipped, int filesFailed, String detail,
+                   boolean itemInFlight) {
             this.kind         = kind;
             this.filesDone    = filesDone;
             this.filesSkipped = filesSkipped;
             this.filesFailed  = filesFailed;
             this.detail       = (detail == null) ? "" : detail;
+            this.itemInFlight = itemInFlight;
         }
 
         /**
          * Short text for the queue table's Status column and the CLI.
          *
-         * PARTIAL and CANCELED carry their detail too. For a free-space wipe the
-         * detail is the only place the leftover wipe files are named, and the
-         * counts on their own ("0 done, 0 skipped, 1 failed") say nothing about
-         * how much disk is still occupied or where. Dropping it here would leave
-         * that information in the opt-in erasure report alone.
+         * Every kind carries its detail, including the two successful ones. A
+         * row can succeed and still have something the user has to know about:
+         * a hard-linked file destroys content that another name still points
+         * at, and that warning would otherwise reach only the opt-in erasure
+         * report. For a free-space wipe the detail is the only place the
+         * leftover wipe files are named, and the counts on their own ("0 done,
+         * 0 skipped, 1 failed") say nothing about how much disk is still
+         * occupied or where.
          */
         String statusText() {
             switch (kind) {
-                case SHREDDED:      return "Done";
-                case CRYPTO_ERASED: return "Done (crypto erased)";
+                case SHREDDED:      return detail.isEmpty() ? "Done" : "Done: " + detail;
+                case CRYPTO_ERASED: return detail.isEmpty()
+                        ? "Done (crypto erased)" : "Done (crypto erased): " + detail;
                 case PARTIAL: {
                     String head = "Partial (" + filesDone + " done, "
                             + filesSkipped + " skipped, " + filesFailed + " failed)";
@@ -166,12 +217,12 @@ public class DataShredderV4 {
         // ---------------------------------------------------------------------
 
         enum Algorithm {
-            RANDOM      ("Random Data Overwrite (Custom Passes)",               "random", false),
-            DOD3        ("DoD 5220.22-M Standard (3 Passes)",                   "dod3",   false),
-            GUTMANN     ("Gutmann Method (35 Passes)",                          "gutmann",false),
-            ZERO        ("Zero Overwrite (1 Pass + Verify)",                    "zero",   true),
-            NVME_PURGE  ("NIST SP 800-88 Purge (4 Passes + Verify)",            "nvme",   true),
-            CRYPTO_ERASE("ChaCha20 Cryptographic Erase (1 Pass, key discarded)","crypto", false);
+            RANDOM      ("Random Data Overwrite (Custom Passes)",        "random", false),
+            DOD3        ("3-Pass Overwrite (Zeros, Ones, Random)",       "dod3",   false),
+            GUTMANN     ("Gutmann Method (35 Passes)",                   "gutmann",false),
+            ZERO        ("Zero Overwrite (1 Pass + Verify)",             "zero",   true),
+            NVME_PURGE  ("4-Pass Overwrite + Verify (Ends in Zeros)",    "nvme",   true),
+            CRYPTO_ERASE("ChaCha20 Cryptographic Erase (1 Pass)",        "crypto", false);
 
             final String displayName;
             final String cliName;
@@ -184,7 +235,11 @@ public class DataShredderV4 {
                 this.requiresZeroVerification = requiresZeroVerification;
             }
 
-            /** How many times each byte is written, used for the byte total. */
+            /**
+             * How many times each byte is written. The byte total adds the
+             * verification read on top of this; the user-facing pass count
+             * stays the write-pass count alone.
+             */
             int passMultiplier(int randomPasses) {
                 switch (this) {
                     case GUTMANN:      return 35;
@@ -192,7 +247,8 @@ public class DataShredderV4 {
                     case NVME_PURGE:   return 4;
                     case ZERO:         return 1;
                     case CRYPTO_ERASE: return 1;   // reads and writes each byte once
-                    default:           return Math.max(1, randomPasses);
+                    case RANDOM:       return Math.max(1, randomPasses);
+                    default:           throw new IllegalStateException("Unhandled algorithm: " + name());
                 }
             }
 
@@ -204,7 +260,8 @@ public class DataShredderV4 {
                     case NVME_PURGE:   return 4;
                     case ZERO:         return 1;
                     case CRYPTO_ERASE: return 1;
-                    default:           return -1;
+                    case RANDOM:       return -1;
+                    default:           throw new IllegalStateException("Unhandled algorithm: " + name());
                 }
             }
 
@@ -278,6 +335,22 @@ public class DataShredderV4 {
         private volatile boolean    paused          = false;
 
         private volatile Listener listener = NULL_LISTENER;
+
+        /**
+         * The one read and write buffer for a whole run. A run uses a single
+         * engine on a single worker thread, so shredFile, verifyZeroFill and
+         * performCryptoErase can share it instead of allocating 1 MiB per file.
+         */
+        private final byte[] ioBuffer = new byte[BUFFER_SIZE];
+
+        /** Phase of the file currently in flight; used to word a cancel accurately. */
+        private static final int PHASE_IDLE         = 0;
+        private static final int PHASE_BEFORE_WRITE = 1;
+        private static final int PHASE_OVERWRITE    = 2;
+        private static final int PHASE_VERIFY       = 3;
+        /** Every write and any verification finished; only the rename and delete are left. */
+        private static final int PHASE_DONE         = 4;
+        private int filePhase = PHASE_IDLE;
 
         private volatile long totalBytes         = 0L;
         private volatile long processedBytes     = 0L;
@@ -385,6 +458,7 @@ public class DataShredderV4 {
             totalBytes         = 0L;
             processedBytes     = 0L;
             fileProcessedBytes = 0L;
+            filePhase          = PHASE_IDLE;
             startTimeMs        = System.currentTimeMillis();
             lastReportError    = null;
             reportRows.clear();
@@ -393,6 +467,9 @@ public class DataShredderV4 {
         }
 
         private void recordProgress(int bytes) {
+            // The first recorded chunk of a file is the point where its old
+            // contents stop being intact, which is what a cancel note reports.
+            if (filePhase == PHASE_BEFORE_WRITE) filePhase = PHASE_OVERWRITE;
             processedBytes     += bytes;
             fileProcessedBytes += bytes;
             listener.onProgress(processedBytes);
@@ -418,10 +495,16 @@ public class DataShredderV4 {
              * Entries the scan could not read, one message each. These are
              * per-entry problems, so they are carried through to the row's
              * counters instead of aborting the whole scan; the readable files
-             * beside them still get shredded. A set because both walks visit
-             * the same tree and would otherwise report the same entry twice.
+             * beside them still get shredded. A set, so an entry that fails in
+             * more than one way is still reported once.
              */
             final Set<String> scanFailures = new LinkedHashSet<>();
+            /**
+             * Advisory notes from the scan, such as a file that carries more
+             * than one hard-linked name. These are not failures: they are
+             * carried into the row's detail without touching its counters.
+             */
+            final Set<String> scanNotes = new LinkedHashSet<>();
             boolean  missing   = false;
             boolean  duplicate = false;
             String   scanError = null;
@@ -458,23 +541,30 @@ public class DataShredderV4 {
             return !abs.toRealPath().equals(parent.toRealPath().resolve(abs.getFileName()));
         }
 
+        /** The regular files and the sub-directories of one tree, from one walk. */
+        static final class Scan {
+            final List<File> files = new ArrayList<>();
+            final List<File> dirs  = new ArrayList<>();
+        }
+
         /**
-         * Recursively expands a directory into regular files only. Links and
-         * junctions are never entered, which needs walkFileTree: Files.walk has
-         * no way to skip a subtree.
+         * Recursively expands a directory into its regular files and its
+         * sub-directories in a single walk. Links and junctions are never
+         * entered, which needs walkFileTree: Files.walk has no way to skip a
+         * subtree. Directories come back deepest first, ready for post-shred
+         * deletion, and are neither entered nor listed when they redirect.
          *
          * An entry that cannot be read is recorded and the walk carries on. The
          * default SimpleFileVisitor rethrows instead, which would let a single
          * ACL-restricted subfolder, a System Volume Information directory or a
          * folder locked by another process abort the whole scan and leave every
          * readable file in the tree untouched.
+         *
+         * scanNotes, when given, collects advisory findings such as hard links.
          */
-        List<File> collectFiles(File dir) throws IOException {
-            return collectFiles(dir, new ArrayList<String>());
-        }
-
-        List<File> collectFiles(File dir, Collection<String> scanFailures) throws IOException {
-            final List<File> result = new ArrayList<>();
+        Scan collectTree(File dir, Collection<String> scanFailures,
+                         Collection<String> scanNotes) throws IOException {
+            final Scan scan = new Scan();
             Files.walkFileTree(dir.toPath(), EnumSet.noneOf(FileVisitOption.class),
                     Integer.MAX_VALUE, new SimpleFileVisitor<Path>() {
 
@@ -494,6 +584,7 @@ public class DataShredderV4 {
                         scanFailures.add(scanNote("Could not resolve", p, ex));
                         return FileVisitResult.SKIP_SUBTREE;
                     }
+                    scan.dirs.add(p.toFile());
                     return FileVisitResult.CONTINUE;
                 }
 
@@ -501,7 +592,11 @@ public class DataShredderV4 {
                     checkpoint();
                     if (!Files.isSymbolicLink(p)
                             && Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) {
-                        result.add(p.toFile());
+                        scan.files.add(p.toFile());
+                        if (scanNotes != null) {
+                            String note = hardLinkNote(p);
+                            if (note != null) scanNotes.add(note);
+                        }
                     }
                     return FileVisitResult.CONTINUE;
                 }
@@ -516,51 +611,42 @@ public class DataShredderV4 {
                     return FileVisitResult.CONTINUE;
                 }
             });
-            return result;
+            scan.dirs.sort((a, b) -> Integer.compare(
+                    b.getAbsolutePath().length(), a.getAbsolutePath().length()));
+            return scan;
+        }
+
+        /** The regular files of a tree; the walk itself is collectTree. */
+        List<File> collectFiles(File dir) throws IOException {
+            return collectFiles(dir, new ArrayList<String>());
+        }
+
+        List<File> collectFiles(File dir, Collection<String> scanFailures) throws IOException {
+            return collectTree(dir, scanFailures, null).files;
         }
 
         /**
-         * Collects sub-directories, deepest first, for post-shred deletion.
-         * Links and junctions are neither entered nor listed, so they are left
-         * exactly as they were found. Unreadable entries are recorded rather
-         * than thrown, for the same reason as in collectFiles.
+         * Best-effort warning that a file carries more than one name. Only the
+         * queued name is removed, while the shared content is destroyed for
+         * every other name too. The unix:nlink attribute is unavailable on
+         * Windows and on some file systems, so a failure here is silent: this
+         * can warn, it cannot make the operation safe.
          */
-        List<File> collectDirectories(File dir) throws IOException {
-            return collectDirectories(dir, new ArrayList<String>());
-        }
-
-        List<File> collectDirectories(File dir, Collection<String> scanFailures) throws IOException {
-            final List<File> dirs = new ArrayList<>();
-            Files.walkFileTree(dir.toPath(), EnumSet.noneOf(FileVisitOption.class),
-                    Integer.MAX_VALUE, new SimpleFileVisitor<Path>() {
-
-                @Override public FileVisitResult preVisitDirectory(Path p, BasicFileAttributes a) {
-                    // Same reason as in collectFiles: the scan must stay
-                    // interruptible, and the checkpoint sits outside the try.
-                    checkpoint();
-                    try {
-                        if (isLinkOrJunction(p)) return FileVisitResult.SKIP_SUBTREE;
-                    } catch (IOException | RuntimeException ex) {
-                        scanFailures.add(scanNote("Could not resolve", p, ex));
-                        return FileVisitResult.SKIP_SUBTREE;
+        private static String hardLinkNote(Path p) {
+            try {
+                Object value = Files.getAttribute(p, "unix:nlink");
+                if (value instanceof Number) {
+                    long links = ((Number) value).longValue();
+                    if (links > 1L) {
+                        return p.getFileName() + " has " + links + " hard-linked names;"
+                                + " shredding destroys the shared content but removes"
+                                + " only this name";
                     }
-                    dirs.add(p.toFile());
-                    return FileVisitResult.CONTINUE;
                 }
-
-                @Override public FileVisitResult visitFileFailed(Path p, IOException ex) {
-                    scanFailures.add(scanNote("Could not read", p, ex));
-                    return FileVisitResult.CONTINUE;
-                }
-
-                @Override public FileVisitResult postVisitDirectory(Path p, IOException ex) {
-                    if (ex != null) scanFailures.add(scanNote("Could not finish reading", p, ex));
-                    return FileVisitResult.CONTINUE;
-                }
-            });
-            dirs.sort((a, b) -> Integer.compare(
-                    b.getAbsolutePath().length(), a.getAbsolutePath().length()));
-            return dirs;
+            } catch (UnsupportedOperationException | IOException ignored) {
+                // Not available on this platform or file system.
+            }
+            return null;
         }
 
         /** One scan problem, worded the same way wherever it is discovered. */
@@ -600,19 +686,22 @@ public class DataShredderV4 {
                         row.scanError = "Link or junction, not followed";
                     } else if (item.isDirectory()) {
                         row.isDir = true;
-                        for (File f : collectFiles(item, row.scanFailures)) {
+                        Scan scan = collectTree(item, row.scanFailures, row.scanNotes);
+                        for (File f : scan.files) {
                             if (seenFiles.add(canonicalKey(f))) {
                                 row.files.add(f);
                                 row.sizeBytes += f.length();
                             }
                         }
-                        for (File d : collectDirectories(item, row.scanFailures)) {
+                        for (File d : scan.dirs) {
                             if (seenDirs.add(canonicalKey(d))) row.dirs.add(d);
                         }
                     } else if (item.isFile()) {
                         if (seenFiles.add(canonicalKey(item))) {
                             row.files.add(item);
                             row.sizeBytes = item.length();
+                            String note = hardLinkNote(item.toPath());
+                            if (note != null) row.scanNotes.add(note);
                         } else {
                             row.duplicate = true;
                             row.scanError = "Already covered by an earlier queue item";
@@ -658,7 +747,12 @@ public class DataShredderV4 {
             try {
                 List<Row> rows = expand(topLevelItems);
 
-                final int multiplier = opts.algo.passMultiplier(opts.randomPasses);
+                // Every byte the run will move, not just the ones it writes: an
+                // algorithm that verifies reads the whole file back afterwards,
+                // and that read reports progress like any pass. The user-facing
+                // pass count above stays the write-pass count alone.
+                final int multiplier = opts.algo.passMultiplier(opts.randomPasses)
+                        + (opts.algo.requiresZeroVerification ? 1 : 0);
                 long planned = 0L;
                 for (Row r : rows) {
                     for (File f : r.files) planned += f.length() * (long) multiplier;
@@ -680,7 +774,8 @@ public class DataShredderV4 {
                         // renamed but could not be deleted no longer carries its
                         // original name anywhere on disk.
                         result = new ItemResult(ItemResult.Kind.CANCELED,
-                                c.done, c.skipped, c.failed, cancelDetail(c));
+                                c.done, c.skipped, c.failed, cancelDetail(c),
+                                c.cancelNote != null);
                         recordReportRow(row, result);
                         out.onItemResult(i, result);
                         break;
@@ -707,9 +802,19 @@ public class DataShredderV4 {
             return failures;
         }
 
-        private static final class Counters {
+        /** Package-private so the cancel wording can be checked headlessly. */
+        static final class Counters {
             int done, skipped, failed;
             final List<String> notes = new ArrayList<>();
+
+            /**
+             * What a cancel did to the file that was in flight, if one was.
+             * It is held apart from the notes because it must survive the
+             * 400-character cap that joinNotes puts on them, and because its
+             * absence is what tells a cancel taken between items from one
+             * taken part way through destroying a file.
+             */
+            String cancelNote = null;
         }
 
         /** The row's notes as one bounded string, worded the same way everywhere. */
@@ -719,14 +824,62 @@ public class DataShredderV4 {
             return detail;
         }
 
-        /** Detail for a row that was cut short, keeping whatever it had recorded. */
-        private static String cancelDetail(Counters c) {
+        /**
+         * Detail for a row that was cut short, keeping whatever it had recorded.
+         * The phase note carries the state of the file that was in flight, so
+         * the closing sentence only speaks for the items the run never reached:
+         * those are untouched, which is not the same as the interrupted file
+         * being intact.
+         *
+         * The phase note leads and is exempt from the 400-character cap. It is
+         * the one sentence that says what happened to the file the cancel
+         * landed on, and a row that had already gathered a screenful of notes
+         * (a folder of read-only files, say) would otherwise push it out of the
+         * capped text entirely and leave only wording that reads as if nothing
+         * had been destroyed.
+         */
+        static String cancelDetail(Counters c) {
             String notes = joinNotes(c);
-            // The word "canceled" is left to the kind, which both the status text
-            // and the report already print, so it is not repeated here.
-            return notes.isEmpty()
-                    ? "remaining data left in place"
-                    : notes + "; remaining data left in place";
+            StringBuilder sb = new StringBuilder();
+            if (c.cancelNote != null) sb.append(c.cancelNote);
+            if (!notes.isEmpty()) {
+                if (sb.length() > 0) sb.append("; ");
+                sb.append(notes);
+            }
+            if (sb.length() > 0) sb.append("; ");
+            sb.append("items not yet reached were not touched");
+            return sb.toString();
+        }
+
+        /**
+         * What a cancel did to the file that was in flight, worded from the
+         * phase it was interrupted in rather than from an assumption that a
+         * file the run did not delete is still intact.
+         *
+         * Each note starts at the phase, not at the word "canceled": the kind
+         * is printed ahead of the detail by both the status text and the
+         * report, so repeating it would produce "Canceled: Canceled while...".
+         */
+        private static String cancelPhaseNote(File file, int phase) {
+            switch (phase) {
+                case PHASE_OVERWRITE:
+                    return "Overwriting " + file.getName()
+                            + " was interrupted: contents partially destroyed, file kept";
+                case PHASE_VERIFY:
+                    return "Verifying " + file.getName()
+                            + " was interrupted: overwrite complete,"
+                            + " verification incomplete, file kept";
+                case PHASE_DONE:
+                    // The checkpoint that guards the rename and the delete. Every
+                    // pass, and any verification, already finished and passed, so
+                    // reporting this as an interrupted overwrite would understate
+                    // what happened to the contents.
+                    return "Interrupted after " + file.getName() + " was processed"
+                            + ": overwrite complete, file kept";
+                default:
+                    return "Interrupted before anything was written to " + file.getName()
+                            + ": file untouched";
+            }
         }
 
         private ItemResult processRow(int rowIndex, Row row, Options opts,
@@ -773,22 +926,33 @@ public class DataShredderV4 {
                 out.onFileStart(rowIndex, file.getName(), planned);
                 out.onFileProgress(0L);
 
+                filePhase = PHASE_BEFORE_WRITE;
                 try {
                     shredFile(file, opts.algo, opts.randomPasses);
 
-                    if (opts.algo.requiresZeroVerification) verifyZeroFill(file);
+                    if (opts.algo.requiresZeroVerification) {
+                        filePhase = PHASE_VERIFY;
+                        verifyZeroFill(file);
+                    }
 
                     // The write loops only check between chunks, so a cancel that
                     // arrives during the final chunk of the final pass would
                     // otherwise fall straight through to the rename, the
                     // timestamp scrub and the delete, and the row would be
                     // reported as Done. A cancel means the file stays where it
-                    // is, whichever chunk it landed on.
+                    // is, whichever chunk it landed on. The phase moves first so
+                    // the note reports a finished overwrite rather than an
+                    // interrupted one.
+                    filePhase = PHASE_DONE;
                     checkpoint();
 
                     if (opts.algo == Algorithm.CRYPTO_ERASE) {
-                        // Content is unrecoverable because the key is gone. The file
-                        // keeps its name and timestamps and is never deleted.
+                        // The plaintext is gone from the file. Reading it back
+                        // means recovering the key, whose local arrays were
+                        // zeroed, though copies inside SecretKeySpec and the
+                        // cipher's expanded key schedule stay on the JVM heap
+                        // until garbage collection. The file keeps its name and
+                        // timestamps and is never deleted.
                         c.done++;
                     } else {
                         File scrubbed = scrubFilename(file);
@@ -804,9 +968,25 @@ public class DataShredderV4 {
                                     + ", now at " + scrubbed.getAbsolutePath());
                         }
                     }
-                } catch (IOException | OverlappingFileLockException ex) {
+                } catch (CancelException ce) {
+                    // Cancel is not a per-file failure, it is the user stopping
+                    // the run, so it has to leave this loop. The note is
+                    // recorded first because the row is closed by the caller and
+                    // this is the only place that still knows what state the
+                    // file is in. It goes in its own field rather than into the
+                    // notes so that cancelDetail can put it first and keep it
+                    // whole, and so the GUI can tell that an item really was in
+                    // flight when the cancel arrived.
+                    c.cancelNote = cancelPhaseNote(file, filePhase);
+                    throw ce;
+                } catch (IOException | RuntimeException ex) {
+                    // The exception class is named as well as its message: an
+                    // unchecked exception often carries no message at all, and
+                    // "file.bin: null" says nothing about what went wrong.
                     c.failed++;
-                    c.notes.add(file.getName() + ": " + ex.getMessage());
+                    c.notes.add(file.getName() + ": " + ex);
+                } finally {
+                    filePhase = PHASE_IDLE;
                 }
             }
 
@@ -855,13 +1035,23 @@ public class DataShredderV4 {
                             c.notes.add("Could not remove directory: " + dir.getAbsolutePath()
                                     + ", now at " + scrubbed.getAbsolutePath());
                         }
-                    } catch (IOException ex) {
+                    } catch (CancelException ce) {
+                        throw ce;
+                    } catch (IOException | RuntimeException ex) {
                         c.failed++;
-                        c.notes.add("Directory error " + dir.getAbsolutePath()
-                                + ": " + ex.getMessage());
+                        c.notes.add("Directory error " + dir.getAbsolutePath() + ": " + ex);
                     }
                 }
             }
+
+            // Advisory findings from the scan. They describe the work rather
+            // than a problem with it, so they are reported without touching the
+            // counters that decide the row's status. They are added last on
+            // purpose: joinNotes caps the detail at 400 characters, and a
+            // handful of hard-linked files would otherwise spend that whole
+            // budget on advice and push out the notes the loop produced, one of
+            // which names where a destroyed but undeleted file now sits.
+            c.notes.addAll(row.scanNotes);
 
             String detail = joinNotes(c);
 
@@ -890,7 +1080,7 @@ public class DataShredderV4 {
             final long fileSize = file.length();
             if (fileSize == 0) return; // nothing to overwrite; caller handles deletion
 
-            final byte[] buffer = new byte[BUFFER_SIZE];
+            final byte[] buffer = ioBuffer;
 
             try (RandomAccessFile raf     = new RandomAccessFile(file, "rw");
                  FileChannel      channel = raf.getChannel();
@@ -917,8 +1107,13 @@ public class DataShredderV4 {
                         overwriteNVMePurge(raf, buffer, fileSize);
                         break;
                     case CRYPTO_ERASE:
-                        performCryptoErase(raf, fileSize);
+                        performCryptoErase(raf, fileSize, buffer);
                         break;
+                    default:
+                        // A new algorithm that reaches this point would be
+                        // renamed, scrubbed and deleted without a single
+                        // overwrite pass, and reported as done.
+                        throw new IllegalStateException("Unhandled algorithm: " + algo.name());
                 }
                 channel.force(true);
             }
@@ -928,14 +1123,26 @@ public class DataShredderV4 {
         // Overwrite primitives
         // ---------------------------------------------------------------------
 
+        /**
+         * The chunk size is decided before the random bytes are generated, so a
+         * short final chunk costs only the bytes it writes. Filling the whole
+         * 1 MiB buffer first made a 1 KB file pay for 1 MiB of SecureRandom
+         * output on every pass, eight times over under Gutmann.
+         */
         void overwriteRandom(RandomAccessFile raf, byte[] buffer, long length) throws IOException {
             raf.seek(0);
             long written = 0;
             while (written < length) {
                 checkpoint();
-                RANDOM.nextBytes(buffer);
                 int writeSize = (int) Math.min(buffer.length, length - written);
-                raf.write(buffer, 0, writeSize);
+                if (writeSize == buffer.length) {
+                    RANDOM.nextBytes(buffer);
+                    raf.write(buffer, 0, writeSize);
+                } else {
+                    byte[] tail = new byte[writeSize];
+                    RANDOM.nextBytes(tail);
+                    raf.write(tail);
+                }
                 written += writeSize;
                 recordProgress(writeSize);
             }
@@ -973,8 +1180,10 @@ public class DataShredderV4 {
         }
 
         /**
-         * DoD 5220.22-M three-pass wipe.
-         * Correct order per the standard: zeros -> ones -> random.
+         * The classic three-pass sequence historically attributed to
+         * DoD 5220.22-M: zeros, then ones, then random. The current NISPOM
+         * specifies no overwrite method, and this implementation does not
+         * verify what it wrote.
          */
         void overwriteDoD3(RandomAccessFile raf, byte[] buffer, long length) throws IOException {
             overwritePattern(raf, buffer, length, (byte) 0x00);
@@ -983,8 +1192,11 @@ public class DataShredderV4 {
         }
 
         /**
-         * Deterministic pattern passes 5 to 31 of the Gutmann method, in the
-         * order given by the paper. Passes 1 to 4 and 32 to 35 are random.
+         * Deterministic pattern passes 5 to 31 of the Gutmann method, listed in
+         * the order the paper prints them. Passes 1 to 4 and 32 to 35 are
+         * random. The paper specifies that passes 5 to 31 are written in a
+         * random permutation, which overwriteGutmann performs per file; this
+         * table itself stays in paper order.
          */
         static final byte[][] GUTMANN_PATTERNS = {
             {0x55, 0x55, 0x55},                              // 5
@@ -1016,38 +1228,62 @@ public class DataShredderV4 {
             {(byte) 0xDB, 0x6D, (byte) 0xB6},                // 31
         };
 
+        /**
+         * Four random passes, the 27 deterministic patterns in a fresh random
+         * permutation, then four more random passes. Permuting the pattern
+         * passes is what the paper specifies, so the order differs from file to
+         * file while the table above stays in paper order.
+         */
         void overwriteGutmann(RandomAccessFile raf, byte[] buffer, long length) throws IOException {
             for (int i = 0; i < 4; i++) overwriteRandom(raf, buffer, length);
-            for (byte[] p : GUTMANN_PATTERNS) overwriteCustomPattern(raf, buffer, length, p);
+            List<byte[]> shuffled = new ArrayList<>(Arrays.asList(GUTMANN_PATTERNS));
+            Collections.shuffle(shuffled, RANDOM);
+            for (byte[] p : shuffled) overwriteCustomPattern(raf, buffer, length, p);
             for (int i = 0; i < 4; i++) overwriteRandom(raf, buffer, length);
         }
 
         /**
-         * NIST SP 800-88 inspired 4-pass purge.
-         * The last pass is zeros, which enables post-write verification.
+         * A 4-pass scheme of this tool's own design: a random 32-byte pattern,
+         * its complement, random, then zeros. It is loosely motivated by the
+         * discussion in SP 800-88 and is not a NIST technique. The last pass is
+         * zeros, which enables post-write verification.
          */
         void overwriteNVMePurge(RandomAccessFile raf, byte[] buffer, long length) throws IOException {
-            byte[] key = new byte[32];
-            RANDOM.nextBytes(key);
-            overwriteCustomPattern(raf, buffer, length, key);
-
+            byte[] key        = new byte[32];
             byte[] complement = new byte[32];
-            for (int i = 0; i < 32; i++) complement[i] = (byte) ~key[i];
-            overwriteCustomPattern(raf, buffer, length, complement);
+            try {
+                RANDOM.nextBytes(key);
+                overwriteCustomPattern(raf, buffer, length, key);
 
-            overwriteRandom(raf, buffer, length);
-            overwritePattern(raf, buffer, length, (byte) 0x00);
+                for (int i = 0; i < 32; i++) complement[i] = (byte) ~key[i];
+                overwriteCustomPattern(raf, buffer, length, complement);
+
+                overwriteRandom(raf, buffer, length);
+                overwritePattern(raf, buffer, length, (byte) 0x00);
+            } finally {
+                // The patterns say nothing about the file, but leaving them on
+                // the heap costs nothing to avoid.
+                Arrays.fill(key,        (byte) 0);
+                Arrays.fill(complement, (byte) 0);
+            }
         }
 
         /**
          * ChaCha20 in-place cryptographic erase.
          *
-         * A random 256-bit key and 96-bit nonce encrypt the file in place and are
-         * then wiped from memory. Without the key the ciphertext is
-         * computationally indistinguishable from random noise. ChaCha20 ships in
-         * the standard JDK from Java 11, so no extra dependency is needed.
+         * A random 256-bit key and 96-bit nonce encrypt the file in place.
+         * Without the key the ciphertext is computationally indistinguishable
+         * from random noise. ChaCha20 ships in the standard JDK from Java 11, so
+         * no extra dependency is needed.
+         *
+         * The local key and nonce arrays are zeroed in the finally block, but
+         * copies inside SecretKeySpec and the cipher's expanded key schedule
+         * stay on the JVM heap until garbage collection. Neither can be reached
+         * from pure Java, so this is a limitation of the implementation and not
+         * something the zeroing here removes.
          */
-        void performCryptoErase(RandomAccessFile raf, long fileSize) throws IOException {
+        void performCryptoErase(RandomAccessFile raf, long fileSize, byte[] inBuf)
+                throws IOException {
             byte[] key   = new byte[32]; // 256-bit key
             byte[] nonce = new byte[12]; // 96-bit nonce required by ChaCha20
 
@@ -1062,8 +1298,7 @@ public class DataShredderV4 {
                         new ChaCha20ParameterSpec(nonce, 0));
 
                 raf.seek(0);
-                byte[] inBuf     = new byte[BUFFER_SIZE];
-                long   processed = 0;
+                long processed = 0;
 
                 while (processed < fileSize) {
                     checkpoint();
@@ -1072,28 +1307,44 @@ public class DataShredderV4 {
                     if (read == -1) break;
 
                     byte[] encrypted = cipher.update(inBuf, 0, read);
-                    if (encrypted != null && encrypted.length > 0) {
-                        raf.seek(processed);
-                        raf.write(encrypted);
+                    // A provider that buffers instead of returning one output
+                    // byte per input byte would leave a gap of untouched
+                    // plaintext behind and put the rest of the file at the
+                    // wrong offset. ChaCha20 is a stream cipher, so this cannot
+                    // happen with the JDK provider, and a provider where it can
+                    // must not be allowed to half-erase the file in silence.
+                    if (encrypted == null || encrypted.length != read) {
+                        throw new IOException("ChaCha20 provider returned "
+                                + (encrypted == null ? 0 : encrypted.length)
+                                + " bytes for " + read + " input bytes;"
+                                + " refusing to leave plaintext behind");
                     }
+                    raf.seek(processed);
+                    raf.write(encrypted);
                     processed += read;
                     recordProgress(read);
                 }
 
                 byte[] finalBlock = cipher.doFinal();
                 if (finalBlock != null && finalBlock.length > 0) {
-                    raf.seek(processed);
-                    raf.write(finalBlock);
-                    recordProgress(finalBlock.length);
+                    // Every input byte has already been accounted for above, so
+                    // a trailing block would be written past the end of the
+                    // file and change its length. Same reasoning as above.
+                    throw new IOException("ChaCha20 provider returned a final block of "
+                            + finalBlock.length + " bytes past the end of the file;"
+                            + " refusing to leave plaintext behind");
                 }
                 raf.getFD().sync();
 
             } catch (GeneralSecurityException ex) {
                 throw new IOException("ChaCha20 crypto erase failed: " + ex.getMessage(), ex);
             } finally {
-                // Wipe key material from the heap whatever happened
+                // Wipe the key material and the last block of plaintext whatever
+                // happened. The buffer is shared with the rest of the run, which
+                // is safe: every later use fills it before reading it.
                 Arrays.fill(key,   (byte) 0);
                 Arrays.fill(nonce, (byte) 0);
+                Arrays.fill(inBuf, (byte) 0);
             }
         }
 
@@ -1103,10 +1354,16 @@ public class DataShredderV4 {
 
         /**
          * Verifies that every byte in the file is 0x00. Only called after ZERO
-         * and NVME_PURGE, both of which end with a zero-fill pass.
+         * and NVME_PURGE, both of which end with a zero-fill pass. The read is
+         * reported as progress like any pass, and the run's byte total budgets
+         * for it, so the bar keeps moving through a large file.
+         *
+         * The read goes back through the operating system after force(true), so
+         * it confirms what the OS committed rather than what the physical
+         * medium now holds.
          */
         void verifyZeroFill(File file) throws IOException {
-            byte[] buffer = new byte[BUFFER_SIZE];
+            byte[] buffer = ioBuffer;
             try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
                 long remaining = raf.length();
                 long offset    = 0;
@@ -1122,6 +1379,7 @@ public class DataShredderV4 {
                     }
                     remaining -= read;
                     offset    += read;
+                    recordProgress(read);
                 }
             }
         }
@@ -1142,26 +1400,61 @@ public class DataShredderV4 {
             }
         }
 
-        /** Renames three times to random names to frustrate directory-entry recovery. */
+        /**
+         * Renames to random names before deletion, so the live directory entry
+         * no longer carries the original name. Freed directory entries and the
+         * file system journal may still retain it; renaming cannot remove those.
+         */
         File scrubFilename(File file) throws IOException {
             Path current = file.toPath();
             for (int i = 0; i < 3; i++) {
-                Path next = current.resolveSibling(generateRandomName());
-                try {
-                    Files.move(current, next, StandardCopyOption.ATOMIC_MOVE);
-                } catch (AtomicMoveNotSupportedException ex) {
-                    Files.move(current, next);
-                }
-                current = next;
+                current = moveToRandomName(current);
             }
             return current.toFile();
+        }
+
+        /**
+         * One rename to a free random name. A name that is already taken is not
+         * a reason to stop: the item would then be left sitting under whichever
+         * random name the previous rename gave it, and the caller's note would
+         * still be naming the original. REPLACE_EXISTING is deliberately not
+         * used, because it would destroy whatever already holds that name.
+         */
+        private Path moveToRandomName(Path current) throws IOException {
+            for (int attempt = 0; attempt < 100; attempt++) {
+                Path next = current.resolveSibling(generateRandomName());
+                if (Files.exists(next)) continue;
+                try {
+                    try {
+                        Files.move(current, next, StandardCopyOption.ATOMIC_MOVE);
+                    } catch (AtomicMoveNotSupportedException ex) {
+                        Files.move(current, next);
+                    }
+                    return next;
+                } catch (FileAlreadyExistsException ex) {
+                    // The exists() check above is racy, so the collision has to
+                    // be handled here too. A fresh name is tried.
+                    continue;
+                } catch (IOException ex) {
+                    throw new IOException("Could not rename " + current
+                            + " to a random name: " + ex, ex);
+                }
+            }
+            throw new IOException("Could not find a free random name for " + current
+                    + " after 100 attempts");
         }
 
         boolean deleteFilePermanently(File file) {
             for (int i = 0; i < 3; i++) {
                 try {
                     file.setWritable(true);
-                    Files.deleteIfExists(file.toPath());
+                    if (!Files.deleteIfExists(file.toPath())) {
+                        // Nothing was there to delete. Both callers pass a path a
+                        // rename has just created, so this means something else
+                        // removed the entry first; the entry being gone is still
+                        // the outcome that was asked for.
+                        System.err.println("Delete target was already absent: " + file);
+                    }
                     return true;
                 } catch (IOException ex) {
                     System.err.println("Delete attempt " + (i + 1) + " failed: " + ex.getMessage());
@@ -1279,9 +1572,18 @@ public class DataShredderV4 {
                         long fileWritten = 0L;
                         while (fileWritten < fileTarget) {
                             checkpoint();
-                            RANDOM.nextBytes(buffer);
+                            // Same reorder as overwriteRandom: the chunk size is
+                            // known before the random bytes are generated, so a
+                            // short final chunk costs only what it writes.
                             int chunk = (int) Math.min(buffer.length, fileTarget - fileWritten);
-                            raf.write(buffer, 0, chunk);
+                            if (chunk == buffer.length) {
+                                RANDOM.nextBytes(buffer);
+                                raf.write(buffer, 0, chunk);
+                            } else {
+                                byte[] tail = new byte[chunk];
+                                RANDOM.nextBytes(tail);
+                                raf.write(tail);
+                            }
                             fileWritten += chunk;
                             written     += chunk;
                             recordProgress(chunk);
@@ -1640,6 +1942,7 @@ public class DataShredderV4 {
                                 : "not found";
                     System.out.println("  " + f.getAbsolutePath() + "  [" + kind + "]");
                 }
+                System.out.println(FLASH_CAVEAT);
                 System.out.println("Add --yes to proceed.");
                 return EXIT_USAGE;
             }
@@ -1647,6 +1950,7 @@ public class DataShredderV4 {
             System.out.println(APP_NAME + " " + APP_VERSION);
             System.out.println("Algorithm: " + opts.algo.displayName);
             System.out.println("Passes:    " + opts.algo.passMultiplier(opts.randomPasses));
+            System.out.println(FLASH_CAVEAT);
 
             ShredEngine engine  = new ShredEngine();
             CliListener printer = new CliListener(items);
@@ -1986,6 +2290,16 @@ public class DataShredderV4 {
 
         private final List<File>         queue      = new ArrayList<>();
         private final List<ItemResult>   lastResults = new ArrayList<>();
+
+        /**
+         * The outcome of each queue row of the run that just finished, keyed by
+         * its row index. finishUp decides which rows to drop from that outcome
+         * rather than from the Status text, which carries the row's detail
+         * alongside the word "Done" whenever there is something to say about a
+         * successful row, such as a file that had another hard-linked name.
+         * Cleared at the start of every run, so an index can never be stale.
+         */
+        private final Map<Integer, ItemResult> rowResults = new HashMap<>();
         private final DefaultTableModel  model;
         private final JTable             table;
 
@@ -2055,6 +2369,16 @@ public class DataShredderV4 {
             };
             table.setFillsViewportHeight(true);   // drops below the last row still land on the table
             table.setRowHeight(22);
+
+            // Cell text is file names, paths and exception messages, none of
+            // which is markup. Swing renders a string starting with <html> as
+            // markup by default, so HTML interpretation is turned off for every
+            // column rather than trusting the content.
+            javax.swing.table.DefaultTableCellRenderer plainCells =
+                    new javax.swing.table.DefaultTableCellRenderer();
+            plainCells.putClientProperty("html.disable", Boolean.TRUE);
+            table.setDefaultRenderer(Object.class, plainCells);
+
             table.getColumnModel().getColumn(COL_NAME).setPreferredWidth(320);
             table.getColumnModel().getColumn(COL_SIZE).setPreferredWidth(110);
             table.getColumnModel().getColumn(COL_STATUS).setPreferredWidth(360);
@@ -2277,6 +2601,7 @@ public class DataShredderV4 {
             queue.clear();
             model.setRowCount(0);
             lastResults.clear();
+            rowResults.clear();
             resetBars();
         }
 
@@ -2371,12 +2696,15 @@ public class DataShredderV4 {
 
             int confirm = JOptionPane.showConfirmDialog(this,
                     "This will permanently destroy " + items.size() + " queue item(s),\n"
-                    + "including everything inside any folders listed.\n\nProceed?",
+                    + "including everything inside any folders listed.\n"
+                    + "Nothing listed can be restored by this tool afterwards.\n\n"
+                    + FLASH_CAVEAT + "\n\nProceed?",
                     "Confirmation", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
             if (confirm != JOptionPane.YES_OPTION) return;
 
             for (int i = 0; i < model.getRowCount(); i++) model.setValueAt("Queued", i, COL_STATUS);
             lastResults.clear();
+            rowResults.clear();
             lastWipeResult = null;
             uiState        = UI_RUNNING;
             itemBar.setValue(0);
@@ -2418,6 +2746,7 @@ public class DataShredderV4 {
                     + "- wipe-* leftovers remain if this program is killed part way, or if\n"
                     + "  another program is holding a wipe file open when cleanup runs; the\n"
                     + "  result line names anything that could not be removed\n\n"
+                    + FLASH_CAVEAT + "\n\n"
                     + "Proceed?",
                     "Confirm Free Space Wipe", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
             if (confirm != JOptionPane.YES_OPTION) return;
@@ -2426,6 +2755,7 @@ public class DataShredderV4 {
             opts.writeReport = reportCheckBox.isSelected();
 
             lastResults.clear();
+            rowResults.clear();
             lastWipeResult = null;
             uiState        = UI_RUNNING;
             itemBar.setValue(0);
@@ -2482,10 +2812,17 @@ public class DataShredderV4 {
             }
 
             if (!wipe) {
-                // Drop rows that finished cleanly; leave anything the user should see
+                // Drop rows that finished cleanly; leave anything the user
+                // should see. The kind decides, not the Status text: a row that
+                // succeeded can still carry a detail after the word "Done", for
+                // instance when one of its files had another hard-linked name,
+                // and matching text would then keep a row whose path has just
+                // been destroyed and leave a second Shred press to report it as
+                // missing.
                 for (int i = queue.size() - 1; i >= 0; i--) {
-                    Object status = model.getValueAt(i, COL_STATUS);
-                    if ("Done".equals(status) || "Done (crypto erased)".equals(status)) {
+                    ItemResult r = rowResults.get(i);
+                    if (r != null && (r.kind == ItemResult.Kind.SHREDDED
+                                      || r.kind == ItemResult.Kind.CRYPTO_ERASED)) {
                         queue.remove(i);
                         model.removeRow(i);
                     }
@@ -2510,10 +2847,15 @@ public class DataShredderV4 {
             }
         }
 
+        /**
+         * The text is escaped before the line breaks are turned into markup:
+         * exception messages carry file paths, and a path can contain angle
+         * brackets, which Swing's HTML renderer would otherwise treat as tags.
+         */
         private void showError(String message) {
             JOptionPane.showMessageDialog(this,
                     "<html><b>Error:</b><br>"
-                    + String.valueOf(message).replace("\n", "<br>") + "</html>",
+                    + escapeHtml(message).replace("\n", "<br>") + "</html>",
                     "Error", JOptionPane.ERROR_MESSAGE);
         }
 
@@ -2618,6 +2960,7 @@ public class DataShredderV4 {
                 final ItemResult result = r;
                 SwingUtilities.invokeLater(() -> {
                     lastResults.add(result);
+                    if (row >= 0) rowResults.put(row, result);
                     if (row >= 0 && row < model.getRowCount()) {
                         model.setValueAt(result.statusText(), row, COL_STATUS);
                     } else if (row < 0) {
@@ -2633,6 +2976,55 @@ public class DataShredderV4 {
                 });
             }
 
+            /**
+             * What a cancel actually did, which is not the same sentence on
+             * every path. Read on the event dispatch thread, from inside the
+             * runnable onFinished posts, so it sees the results onItemResult
+             * posted ahead of it.
+             *
+             * A free-space wipe never opens a file of the user's, so nothing of
+             * theirs can have been destroyed. A cancel taken while the queue was
+             * still being expanded never reached a row either, and the engine
+             * reports it without emitting a canceled row, which is what tells
+             * that case apart.
+             *
+             * The remaining two cases both produce a canceled row, so the row's
+             * own itemInFlight flag decides between them rather than its mere
+             * existence: a cancel can also land on one of the checkpoints
+             * between files or between directory removals, where no file was
+             * open and nothing is half destroyed. Only a cancel taken inside
+             * the work on a file carries the phase note this banner points the
+             * user at.
+             */
+            private String canceledBannerText() {
+                if (lastWipeResult != null) {
+                    return "Canceled. The wipe wrote only its own temporary files,"
+                            + " and nothing of yours was touched.";
+                }
+                boolean itemStarted  = false;
+                boolean itemInFlight = false;
+                for (ItemResult r : lastResults) {
+                    if (r.kind == ItemResult.Kind.CANCELED) {
+                        itemStarted  = true;
+                        itemInFlight = r.itemInFlight;
+                        break;
+                    }
+                }
+                if (!itemStarted) {
+                    return "Canceled while the queue was still being read."
+                            + " Nothing on disk was changed.";
+                }
+                if (!itemInFlight) {
+                    return "Canceled between items. Nothing was left part way"
+                            + " destroyed: files already finished were destroyed"
+                            + " as asked, and items not yet reached were not"
+                            + " touched.";
+                }
+                return "Canceled. The item that was interrupted may be partly or"
+                        + " completely destroyed, and its row says how far it got;"
+                        + " items not yet reached were not touched.";
+            }
+
             @Override public void onFinished(int failures, boolean canceled) {
                 final int     f = failures;
                 final boolean c = canceled;
@@ -2644,7 +3036,7 @@ public class DataShredderV4 {
                     String text;
                     if (c) {
                         overallBar.setForeground(Color.RED);
-                        text = "Canceled. Anything part way through was left in place.";
+                        text = canceledBannerText();
                     } else if (f > 0) {
                         overallBar.setForeground(Color.ORANGE);
                         text = "Finished with " + f + " failed item(s).";
@@ -2679,10 +3071,15 @@ public class DataShredderV4 {
                 ex.printStackTrace();
             }
 
+            // The dialog is posted to the event dispatch thread rather than
+            // built on whichever thread died: showing it from a non-Swing
+            // thread breaks the single-thread rule. invokeLater is legal from
+            // the event dispatch thread too, so no thread test is needed.
             Thread.setDefaultUncaughtExceptionHandler((t, ex) ->
-                    JOptionPane.showMessageDialog(null,
-                            "Unhandled error: " + ex.getMessage(),
-                            "Fatal Error", JOptionPane.ERROR_MESSAGE));
+                    SwingUtilities.invokeLater(() ->
+                            JOptionPane.showMessageDialog(null,
+                                    "Unhandled error: " + ex.getMessage(),
+                                    "Fatal Error", JOptionPane.ERROR_MESSAGE)));
 
             SwingUtilities.invokeLater(() -> new Gui().setVisible(true));
         }

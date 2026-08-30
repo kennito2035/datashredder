@@ -1,5 +1,166 @@
 # Changelog - DataShredder v4
 
+## v4.1.0 (2026-08-30)
+
+An audit release. Everything below is a correctness, hardening, or honesty fix
+against v4.0.1; no feature was added or removed and the CLI surface is unchanged.
+
+---
+
+### Fixes
+
+- **ChaCha20 crypto erase refuses a provider that does not preserve length.** The
+  loop assumed `Cipher.update` returns exactly one output byte per input byte. A
+  buffering provider would have left a gap of untouched plaintext and put the
+  rest of the file at the wrong offset, silently. The erase now throws when the
+  returned block is null or the wrong size, and when `doFinal` returns a
+  trailing block that would be written past the end of the file.
+- **A short final chunk no longer costs a full buffer of random data.** The
+  chunk size is computed before `SecureRandom` fills the buffer, in
+  `overwriteRandom` and in the free-space wipe fill loop. Shredding a 1 KB file
+  with Gutmann generated roughly 8 MiB of random data per file; it now generates
+  roughly 8 KB.
+- **A random-name collision no longer strands a file mid-rename.** `scrubFilename`
+  retries with a fresh random name, up to 100 attempts, checking both
+  `Files.exists` and `FileAlreadyExistsException`, because the check alone is
+  racy. `REPLACE_EXISTING` is still never used. A terminal failure now throws a
+  message naming the path the item actually sits at, not the name it started
+  with.
+- **A vacuous delete is visible.** `deleteFilePermanently` captures the result of
+  `Files.deleteIfExists` and logs "Delete target was already absent" when nothing
+  was there. The outcome stays a success, since the entry being gone is what was
+  asked for.
+- **An unchecked exception no longer abandons the rest of the run.** The per-file
+  and per-directory handlers catch `RuntimeException` as well as `IOException`,
+  and rethrow `CancelException` first so a user cancel is never swallowed. Notes
+  name the exception class as well as its message, because an unchecked
+  exception often carries no message at all.
+- **An unhandled algorithm cannot reach the delete path.** The dispatch switch in
+  `shredFile`, and both switches on the `Algorithm` enum, now throw
+  `IllegalStateException` instead of falling through. Without this, a future
+  enum constant would have been renamed, timestamp-scrubbed, deleted, and
+  reported as done without a single overwrite pass.
+- **Cancel says what actually happened to the file it interrupted.** The row note
+  names the file and the phase: untouched, contents partially destroyed and the
+  file kept, overwrite complete with verification incomplete, or overwrite
+  complete with the file kept because the cancel landed on the checkpoint that
+  guards the rename and the delete. The row detail no longer says "left in
+  place" in a way that implies the contents are intact. That note leads the
+  detail and is exempt from its 400-character cap, so a row that had already
+  gathered a screenful of notes, a folder of read-only files for instance,
+  cannot truncate away the one sentence saying a file was part way destroyed.
+  Each note also starts at the phase rather than at the word "canceled", which
+  the status line and the report already print, so nothing reads "Canceled:
+  Canceled while ...".
+- **The canceled banner is worded per path instead of once for all of them.** A
+  cancel taken while the queue was still being expanded says nothing on disk was
+  changed, because nothing had been opened yet. A canceled free space wipe says
+  the wipe wrote only its own temporary files, because it never opens a file of
+  the user's. A cancel taken at a checkpoint between items says nothing was left
+  part way destroyed, instead of telling the user an item may have been
+  completely destroyed when none was open. Only a cancel that actually
+  interrupted a queued item talks about destroyed contents, and it points at the
+  row that carries the phase, which that row is now guaranteed to have.
+- **A successful row shows its detail.** `statusText` dropped the detail for the
+  two success kinds, so the hard-link warning below reached the erasure report
+  and nothing else. Every kind now carries it, and a clean row still reads
+  "Done" because its detail is empty.
+- **Finished rows are cleared by their outcome, not by their status text.** The
+  queue dropped rows whose Status read exactly "Done" or "Done (crypto erased)",
+  which stopped matching as soon as a successful row could carry a detail. A
+  hard-linked file would have left its row in the queue pointing at a path that
+  had just been destroyed, and the next Shred press would have reported it as
+  missing and failed a run in which nothing was wrong. The row's `ItemResult`
+  decides now.
+- **Advisory scan notes are added after the work, not before it.** The row detail
+  is capped at 400 characters; a folder holding a few hard-linked files used to
+  spend that budget on advice and truncate away the note naming where a
+  destroyed but undeleted file now sits.
+- **Verification reports progress and is budgeted for.** `verifyZeroFill` calls
+  the progress callback per chunk, and the planned byte total for ZERO and
+  NVME_PURGE includes the read back, so the bar and the estimate no longer
+  ignore a whole extra pass over the file. The reported pass count stays the
+  write-pass count.
+
+---
+
+### Hardening
+
+- **One 1 MiB buffer per run instead of one per file.** `shredFile`,
+  `verifyZeroFill`, and `performCryptoErase` share a single engine field; crypto
+  erase no longer allocates a second buffer it never used. The crypto input
+  buffer is zeroed in its `finally` block, and the NVMe pattern and complement
+  arrays are zeroed before that method returns.
+- **One tree walk instead of two.** `collectTree` gathers files and
+  sub-directories in a single `walkFileTree` pass, keeping the pause and cancel
+  checkpoints, the link and junction subtree guard, the per-entry scan failure
+  notes, and the deepest-first directory order.
+- **Hard links are reported where the platform allows it.** The scan reads
+  `unix:nlink` for each regular file and adds an advisory note when a file
+  carries more than one name. The note does not change the row's status.
+  Detection is unavailable on Windows and fails silently there.
+- **Gutmann permutes its deterministic passes.** The 27-entry table is copied and
+  shuffled with the engine's `SecureRandom` before each file, which is what the
+  paper specifies. The static table itself stays in the order the paper prints.
+- **The uncaught-exception dialog is posted to the event dispatch thread.** The
+  handler wraps its `JOptionPane` call in `SwingUtilities.invokeLater` instead of
+  building a dialog on whichever thread died.
+- **Markup in a path or a message cannot reach the HTML renderer.** A shared
+  `escapeHtml` escapes ampersands and angle brackets before the error dialog
+  substitutes line breaks, and the queue table installs a cell renderer with
+  `html.disable` set for every column.
+
+---
+
+### Honest labeling
+
+- **DOD3 is now "3-Pass Overwrite (Zeros, Ones, Random)".** The comments and the
+  README describe it as the classic three-pass sequence historically attributed
+  to DoD 5220.22-M, note that the current NISPOM specifies no overwrite method,
+  and state that this implementation does not verify. "Correct order per the
+  standard" is gone.
+- **NVME_PURGE is now "4-Pass Overwrite + Verify (Ends in Zeros)".** The word
+  purge and every implied NIST compliance claim are gone. It is described as a
+  4-pass scheme of this tool's own design, loosely motivated by the discussion
+  in SP 800-88 and not a NIST technique.
+- **CRYPTO_ERASE is now "ChaCha20 Cryptographic Erase (1 Pass)".** The "key
+  discarded" claim is gone. The docs state that the local key and nonce arrays
+  are zeroed but that copies inside `SecretKeySpec` and the cipher's expanded
+  key schedule remain on the JVM heap until garbage collection, which pure Java
+  cannot prevent.
+- **Filename scrubbing claims only what it does.** The three renames stay, and
+  are described as making the live directory entry no longer carry the original
+  name. Freed directory entries and the file system journal may still retain it.
+- **The flash storage caveat is stated at the moment of destruction.** One line
+  is added to the shred confirmation dialog, the free-space wipe confirmation
+  dialog, the CLI preview, and the CLI run banner, rather than living only in
+  the opt-in report footer and the README.
+- **Neither the GUI nor the README says data "cannot be recovered".** The shred
+  confirmation dialog now carries the claim the README was softened to: nothing
+  listed can be restored by this tool afterwards.
+- **New README limitations.** ACLs and extended attributes are named alongside
+  alternate data streams and cluster slack; the journal and freed directory
+  entries are named as places old names and timestamps survive; verification is
+  described as confirming what the operating system committed rather than what
+  the medium retains; hard links get their own bullet; and the dark palette is
+  documented as tuned for the Windows look and feel, with the default light
+  theme preferred elsewhere.
+
+---
+
+### Tests
+
+`DataShredderV4EngineTest.java` grows from 15 groups to 19: a ZERO run asserting
+the final processed count equals the final byte total and both equal the file
+size times two, unit checks for `escapeHtml`, a canceled detail built from a row
+that already holds more notes than the 400-character cap, and a cancel taken at a
+checkpoint between two queued items. The cancel mid-file group also asserts the
+phase note leads the detail and that the status line does not repeat the word
+canceled. The Gutmann check still asserts the static table is the paper's 27
+patterns and no longer asserts a write order, which is now randomized per file.
+
+---
+
 ## v4.0.1 (2026-08-30)
 
 ### Bug Fixes

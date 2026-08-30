@@ -1,5 +1,5 @@
 /**
- * Engine tests for DataShredder v4.0.0.
+ * Engine tests for DataShredder v4.1.0.
  *
  * Zero dependency, headless, reviewer runnable: plain main(), one PASS or FAIL
  * line per check, a non-zero exit status when anything fails. Everything is
@@ -81,6 +81,10 @@ public class DataShredderV4EngineTest {
             test13JunctionNotFollowed(base);
             test14ReadOnlyLeftoverIsPartial(base);
             test15UnreadableSubdirectory(base);
+            test16ZeroRunByteBudget(base);
+            test17EscapeHtml();
+            test18CancelDetailKeepsThePhaseNote();
+            test19CancelBetweenItems(base);
         } catch (Throwable t) {
             failed++;
             System.out.println("FAIL  unexpected exception: " + t);
@@ -198,8 +202,12 @@ public class DataShredderV4EngineTest {
         }
 
         DataShredderV4.ItemResult first() {
+            return at(0);
+        }
+
+        DataShredderV4.ItemResult at(int index) {
             synchronized (results) {
-                return results.isEmpty() ? null : results.get(0);
+                return index < results.size() ? results.get(index) : null;
             }
         }
     }
@@ -235,7 +243,10 @@ public class DataShredderV4EngineTest {
         }
         check("overwriteCustomPattern tiles the pattern across the file", tiled);
 
-        // Gutmann table: 27 deterministic entries, passes 5 to 31 in paper order
+        // Gutmann table: the 27 deterministic entries for passes 5 to 31, held
+        // in the order the paper prints them. The write order is a fresh random
+        // permutation per file, as the paper specifies, so only the table is
+        // checked here.
         byte[][] g = DataShredderV4.ShredEngine.GUTMANN_PATTERNS;
         checkEquals("Gutmann table holds 27 deterministic patterns", 27, g.length);
         check("Gutmann pass 5 is 55 55 55",
@@ -379,6 +390,13 @@ public class DataShredderV4EngineTest {
         DataShredderV4.ItemResult r = rec.first();
         check("row reports CANCELED",
                 r != null && r.kind == DataShredderV4.ItemResult.Kind.CANCELED);
+        check("the row is flagged as having had an item in flight",
+                r != null && r.itemInFlight);
+        check("the detail leads with the file and the phase it was interrupted in",
+                r != null && r.detail.startsWith("Overwriting " + originalName)
+                          && r.detail.contains("partially destroyed"));
+        check("the status text does not repeat the word canceled",
+                r != null && r.statusText().startsWith("Canceled: Overwriting"));
         check("onFinished reports canceled", rec.finishedCalled && rec.finishedCanceled);
 
         deleteTree(dir);
@@ -800,6 +818,127 @@ public class DataShredderV4EngineTest {
         } finally {
             allowDirectoryRead(denied);
         }
+
+        deleteTree(dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // 16. The byte budget of an algorithm that verifies includes the read back
+    // -------------------------------------------------------------------------
+
+    private static void test16ZeroRunByteBudget(Path base) throws Exception {
+        section("16. A ZERO run budgets for its verification read");
+        Path dir = Files.createDirectory(base.resolve("zerorun"));
+        File f = makeFile(dir, "zeroed.bin", 2 * MIB, (byte) 0x5D);
+
+        DataShredderV4.ShredEngine engine = new DataShredderV4.ShredEngine();
+        Rec rec = new Rec();
+        int failures = engine.run(list(f),
+                options(DataShredderV4.ShredEngine.Algorithm.ZERO, 1), rec);
+
+        checkEquals("ZERO run reports no failures", 0, failures);
+        check("the zeroed file is gone", !f.exists());
+        // One write pass plus the verification read back, both reported.
+        checkEquals("byte total covers the write pass and the verification read",
+                2 * MIB * 2, rec.lastTotal);
+        checkEquals("final processed equals the final byte total",
+                rec.lastTotal, rec.lastProgress);
+        check("onProgress is monotonic", rec.monotonic);
+        DataShredderV4.ItemResult r = rec.first();
+        check("row reports SHREDDED with one file done",
+                r != null && r.kind == DataShredderV4.ItemResult.Kind.SHREDDED
+                        && r.filesDone == 1);
+        checkEquals("the reported pass count stays the write passes only",
+                1, DataShredderV4.ShredEngine.Algorithm.ZERO.passMultiplier(1));
+
+        deleteTree(dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // 17. HTML escaping for the error dialog
+    // -------------------------------------------------------------------------
+
+    private static void test17EscapeHtml() {
+        section("17. HTML escaping of text shown in an html dialog");
+
+        check("angle brackets are escaped",
+                "&lt;img src=x&gt;".equals(DataShredderV4.escapeHtml("<img src=x>")));
+        check("ampersands are escaped first, so an escape is not double escaped",
+                "&amp;lt;".equals(DataShredderV4.escapeHtml("&lt;")));
+        check("plain text is left alone",
+                "C:\\data\\report.txt".equals(DataShredderV4.escapeHtml("C:\\data\\report.txt")));
+        check("a null message does not throw", "null".equals(DataShredderV4.escapeHtml(null)));
+        check("a path with markup in its name cannot open a tag",
+                DataShredderV4.escapeHtml("/tmp/<b>x</b>.bin").indexOf('<') < 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // 18. The cancel phase note survives a row that is already full of notes
+    // -------------------------------------------------------------------------
+
+    private static void test18CancelDetailKeepsThePhaseNote() {
+        section("18. A full row of notes cannot truncate the cancel phase note away");
+
+        DataShredderV4.ShredEngine.Counters c = new DataShredderV4.ShredEngine.Counters();
+        for (int i = 0; i < 20; i++) {
+            c.notes.add("Read-only: aaa_readonly_file_number_" + i + ".dat");
+        }
+        c.cancelNote = "Overwriting zzz_big.bin was interrupted:"
+                + " contents partially destroyed, file kept";
+
+        check("the other notes alone are past the 400 character cap",
+                String.join("; ", c.notes).length() > 400);
+
+        String detail = DataShredderV4.ShredEngine.cancelDetail(c);
+        check("the phase note leads the detail", detail.startsWith(c.cancelNote));
+        check("the detail still says the contents were partially destroyed",
+                detail.contains("partially destroyed"));
+        check("the detail still closes with the items that were not reached",
+                detail.endsWith("items not yet reached were not touched"));
+
+        DataShredderV4.ShredEngine.Counters empty = new DataShredderV4.ShredEngine.Counters();
+        check("a cancel with nothing recorded speaks only for the items not reached",
+                "items not yet reached were not touched"
+                        .equals(DataShredderV4.ShredEngine.cancelDetail(empty)));
+    }
+
+    // -------------------------------------------------------------------------
+    // 19. A cancel taken between items is not reported as an interrupted item
+    // -------------------------------------------------------------------------
+
+    private static void test19CancelBetweenItems(Path base) throws Exception {
+        section("19. A cancel between items leaves nothing part way destroyed");
+        Path dir = Files.createDirectory(base.resolve("betweenitems"));
+        File first  = makeFile(dir, "first.bin",  64 * 1024, (byte) 0x61);
+        File second = makeFile(dir, "second.bin", 64 * 1024, (byte) 0x62);
+        byte[] secondBefore = readAll(second);
+
+        final DataShredderV4.ShredEngine engine = new DataShredderV4.ShredEngine();
+        Rec rec = new Rec() {
+            @Override public void onItemResult(int rowIndex, DataShredderV4.ItemResult r) {
+                super.onItemResult(rowIndex, r);
+                // Requested once the first row is closed, so the cancel lands on
+                // the checkpoint at the top of the second row's file loop with
+                // no file open and nothing written.
+                if (rowIndex == 0) engine.requestCancel();
+            }
+        };
+
+        engine.run(list(first, second), options(DataShredderV4.ShredEngine.Algorithm.RANDOM, 1),
+                rec);
+
+        check("the finished item was destroyed", !first.exists());
+        check("the item the run never reached is byte for byte unchanged",
+                second.exists() && Arrays.equals(secondBefore, readAll(second)));
+
+        DataShredderV4.ItemResult r = rec.at(1);
+        check("the second row reports CANCELED",
+                r != null && r.kind == DataShredderV4.ItemResult.Kind.CANCELED);
+        check("the row is not flagged as having had an item in flight",
+                r != null && !r.itemInFlight);
+        check("the detail claims nothing about a half destroyed file",
+                r != null && "items not yet reached were not touched".equals(r.detail));
+        check("onFinished reports canceled", rec.finishedCalled && rec.finishedCanceled);
 
         deleteTree(dir);
     }

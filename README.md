@@ -1,4 +1,4 @@
-# DataShredder v4.0.1
+# DataShredder v4.1.0
 
 A Java file and directory shredder with a queue interface, per-item and overall progress, pause and resume, free-space wiping, an opt-in erasure report, and a headless command line mode. Six overwrite algorithms including ChaCha20 cryptographic erase. Zero external dependencies. Requires Java 11 or later.
 
@@ -11,7 +11,7 @@ A Java file and directory shredder with a queue interface, per-item and overall 
 - **Drag and drop** - drop files and folders onto the window or the table; the Add button does the same thing through a file chooser
 - **Two progress bars** - one for the file being written, one for the run as a whole, labelled `X% - HH:MM:SS remaining`
 - **Pause and resume** - the worker parks between chunk writes and resumes where it stopped; the estimate ignores paused time
-- **Cancel that leaves data alone** - a cancelled file is never renamed, timestamp-scrubbed, or deleted, whichever pass it was on
+- **Cancel that never deletes** - a cancelled file is never renamed, timestamp-scrubbed, or deleted, whichever pass it was on; when the cancel lands part way through a file, that sentence leads the row detail and names the file and the phase, because a file that was part way through is not intact, and a cancel taken between items says so instead of claiming one
 - **Free-space wipe** - fills the free space of a volume with one random pass, then removes what it wrote, with an optional size cap
 - **Erasure report** - opt-in plain-text record of what ran, what was destroyed, and how each item ended
 - **Headless command line mode** - any argument switches the process to the CLI; Swing is never loaded on that path
@@ -19,10 +19,10 @@ A Java file and directory shredder with a queue interface, per-item and overall 
 - **Links and junctions are never followed** - symbolic links and NTFS directory junctions are excluded from the queue and skipped during a walk, so a junction inside a folder cannot take the shredder outside it
 - **Duplicate work removed** - the expanded queue is deduplicated by canonical path, so queueing a folder and a file inside it shreds that file once
 - **Unreadable entries do not abort a scan** - a folder that cannot be read is recorded against its row and the rest of the tree is still processed
-- **Filename scrubbing** - three renames to random names before deletion, to frustrate directory-entry recovery
+- **Filename scrubbing** - renames to random names before deletion, so the live directory entry no longer carries the original name
 - **Metadata scrubbing** - all timestamps reset to the Unix epoch before deletion
 - **File locking** via `FileChannel.tryLock()` - refuses to shred a file another process holds open
-- **1 MiB write buffer**, `fd.sync()` after every pass
+- **One shared 1 MiB read and write buffer** per run, `fd.sync()` after every pass
 - **Safe-close guard**, destroy-confirm dialog, and a global uncaught-exception handler
 
 ---
@@ -32,15 +32,19 @@ A Java file and directory shredder with a queue interface, per-item and overall 
 | Algorithm | CLI name | Passes | Description |
 |---|---|---|---|
 | **RANDOM** | `random` | 1 to 100 (configurable) | Cryptographically random data via `SecureRandom` |
-| **DOD3** | `dod3` | 3 (fixed) | DoD 5220.22-M: zeros, then ones, then random |
-| **GUTMANN** | `gutmann` | 35 (fixed) | 4 random passes, the 27 deterministic patterns in paper order, then 4 random passes |
+| **DOD3** | `dod3` | 3 (fixed) | The classic three-pass sequence historically attributed to DoD 5220.22-M: zeros, then ones, then random |
+| **GUTMANN** | `gutmann` | 35 (fixed) | 4 random passes, the 27 deterministic patterns in a fresh random permutation, then 4 random passes |
 | **ZERO** | `zero` | 1 (fixed) | Single zero-fill pass with byte-level verification |
-| **NVME_PURGE** | `nvme` | 4 (fixed) | NIST SP 800-88 inspired: random key pattern, complement, random, zeros, then verification |
-| **CRYPTO_ERASE** | `crypto` | 1 (fixed) | ChaCha20 in-place encryption; the 256-bit key and 96-bit nonce are zeroed immediately after use, so the content is computationally unrecoverable |
+| **NVME_PURGE** | `nvme` | 4 (fixed) | A 4-pass scheme of this tool's own design: random pattern, complement, random, zeros, then byte-level verification |
+| **CRYPTO_ERASE** | `crypto` | 1 (fixed) | ChaCha20 in-place encryption; the local 256-bit key and 96-bit nonce arrays are zeroed immediately after use, so the content is computationally unrecoverable |
 
-> **CRYPTO_ERASE behaviour:** the encrypted file stays on disk under its original name, with its original timestamps. It is never renamed, never timestamp-scrubbed, and never deleted, and the folders holding those files are left in place too. Key and nonce are zeroed in a `finally` block.
+> **CRYPTO_ERASE behaviour:** the encrypted file stays on disk under its original name, with its original timestamps. It is never renamed, never timestamp-scrubbed, and never deleted, and the folders holding those files are left in place too. The local key and nonce arrays are zeroed in a `finally` block. Copies of the key inside `SecretKeySpec` and inside the cipher's expanded key schedule stay on the JVM heap until garbage collection; neither can be reached from pure Java, so that is a limitation of the implementation and not something the zeroing removes.
 
-> **Note on Gutmann:** the pattern order is deterministic, exactly as the paper specifies.
+> **Note on DoD 5220.22-M:** the three-pass sequence is the one historically attributed to that standard. The current NISPOM specifies no overwrite method, and this implementation does not verify what it wrote.
+
+> **Note on NIST SP 800-88:** `NVME_PURGE` is a scheme of this tool's own design, loosely motivated by the discussion in SP 800-88. It is not a NIST technique and the document does not describe it.
+
+> **Note on Gutmann:** the 27 deterministic passes are written in a fresh random permutation per file, which is what the paper specifies. The paper's author has since noted that the full 35-pass scheme targets encodings used by drives that are long obsolete, and that on a modern drive a few random passes are what actually matters.
 
 ---
 
@@ -96,7 +100,7 @@ The test prints a `PASS` or `FAIL` line per check, a final count, and exits non-
 
 To wipe free space instead, click **Wipe Free Space**, pick a folder on the volume you want cleaned, and read the confirmation dialog before proceeding.
 
-> **Warning:** shredding is irreversible. Files and directories cannot be recovered after this operation.
+> **Warning:** shredding is irreversible. Files and directories cannot be restored by this tool after this operation. Both confirmation dialogs also state that on SSDs and other flash storage an overwrite may not reach every physical copy of the data.
 
 ---
 
@@ -172,18 +176,18 @@ Only a single random pass is written. That is the design, not a configurable set
 | `overwritePattern` | Fills the file with a repeating single byte, then `fd.sync()` |
 | `overwriteCustomPattern` | Tiles an arbitrary byte array across the file, then `fd.sync()` |
 | `performCryptoErase` | Reads the file in chunks, encrypts in place with ChaCha20, writes back; key and nonce zeroed in `finally` |
-| `verifyZeroFill` | Reads the file back and fails on the first non-zero byte. Only called for ZERO and NVME_PURGE |
+| `verifyZeroFill` | Reads the file back and fails on the first non-zero byte. Only called for ZERO and NVME_PURGE, and reported as progress like any pass |
 
 Every primitive calls a pause and cancel checkpoint between chunks, so both controls respond mid-pass on a large file.
 
 ### Filename and metadata scrubbing
 
-- **`scrubFilename()`** performs three sequential `Files.move()` renames to random 8 to 16 character names, `ATOMIC_MOVE` with a non-atomic fallback.
+- **`scrubFilename()`** performs three sequential `Files.move()` renames to random 8 to 16 character names, `ATOMIC_MOVE` with a non-atomic fallback. A name that is already taken is retried with a fresh random name, up to 100 times, rather than aborting part way through the chain; `REPLACE_EXISTING` is never used. The point is that the live directory entry no longer carries the original name. Freed directory entries and the file system journal may still retain it.
 - **`scrubMetadata()`** sets creation, modification, and access times to `FileTime.fromMillis(0)` through `BasicFileAttributeView`.
 
 ### Directory expansion and deletion
 
-`collectFiles()` and `collectDirectories()` use `Files.walkFileTree`, not `Files.walk`, because a subtree that must not be entered has to be skipped rather than filtered. Symbolic links and junctions are detected by resolving the entry's real path against its parent's real path, since `Files.isSymbolicLink` returns false for an NTFS junction. Directories are sorted deepest first for removal.
+`collectTree()` gathers the files and the sub-directories of a queued folder in a single `Files.walkFileTree` pass, not `Files.walk`, because a subtree that must not be entered has to be skipped rather than filtered. Symbolic links and junctions are detected by resolving the entry's real path against its parent's real path, since `Files.isSymbolicLink` returns false for an NTFS junction. Directories are sorted deepest first for removal.
 
 A directory that still holds entries when its turn comes is kept, not forced. Whatever is inside it is something the run was never going to remove: a link or junction, a read-only file that was skipped, or an entry whose own failure has already been counted. The row records that as a skip and names the directory.
 
@@ -212,11 +216,12 @@ DataShredderV4                        plain class: only main() and nested static
 │   ├── Options                       algorithm, passes, report flag and path, wipe limit
 │   ├── Listener                      6 callbacks, all fired on the worker thread
 │   ├── checkpoint()                  pause wait loop and cancel throw, called between chunks
-│   ├── expand()                      queue expansion, link filtering, canonical-path dedupe
+│   ├── collectTree()                 one walk per queued folder: files, dirs, link filtering
+│   ├── expand()                      queue expansion, hard-link notes, canonical-path dedupe
 │   ├── run()                         shreds the queue; onFinished always fires from finally
 │   ├── overwrite primitives          random / pattern / custom pattern / crypto erase
-│   ├── algorithm methods             DoD3 / Gutmann / NVMe purge
-│   ├── verifyZeroFill()              ZERO and NVME_PURGE only
+│   ├── algorithm methods             3-pass / Gutmann (permuted) / 4-pass ending in zeros
+│   ├── verifyZeroFill()              ZERO and NVME_PURGE only, reported as progress
 │   ├── scrubFilename() x3            plus scrubMetadata() epoch reset
 │   ├── deleteFilePermanently()       3 attempts, 200 ms apart
 │   ├── wipeFreeSpace()               fill, stop conditions, checked cleanup in finally
@@ -266,13 +271,13 @@ Light mode applies no `UIManager` overrides at all, so it is the plain system lo
 
 ## Tests
 
-`DataShredderV4EngineTest.java` ships with the source and is meant to be run by anyone reviewing it. It is a plain `main()` with no test framework, and covers 15 groups:
+`DataShredderV4EngineTest.java` ships with the source and is meant to be run by anyone reviewing it. It is a plain `main()` with no test framework, and covers 19 groups:
 
 1. Pattern primitives, custom-pattern tiling, and the Gutmann table checked against the paper order
 2. Zero-fill verification passing on zeros and failing on a corrupted byte
 3. CRYPTO_ERASE: content changed, length preserved, file still present under its original name
 4. A full RANDOM run: file gone, monotonic progress, final processed equals the final total
-5. Cancel mid-file: the file survives, the row is Canceled, nothing was deleted
+5. Cancel mid-file: the file survives, the row is Canceled, nothing was deleted, and the detail leads with the file and the phase it was interrupted in
 6. Pause: no further progress during a fixed window, then resume and completion
 7. Cancel while paused: the run returns promptly and the file is intact
 8. A read-only file: skipped, with the byte total adjusted downward
@@ -283,15 +288,22 @@ Light mode applies no `UIManager` overrides at all, so it is the plain system lo
 13. A directory junction is not followed
 14. A read-only leftover leaves its row Partial
 15. An unreadable subdirectory is recorded without aborting the scan
+16. A ZERO run: the byte total covers the write pass and the verification read, and the final processed count lands exactly on it
+17. HTML escaping of text that is shown inside an `<html>` dialog
+18. A row already holding more notes than the 400-character detail cap still leads its canceled detail with the phase note
+19. A cancel taken between items: the finished item is destroyed, the item never reached is byte for byte unchanged, and the row claims no half destroyed file
 
 ---
 
 ## Limitations
 
-- **SSD caveat.** A software overwrite cannot guarantee physical erasure on solid state drives, USB flash media, or SD cards. Wear levelling and over-provisioning mean the drive may keep copies the file system never exposed. Use full-disk encryption from the start, or the drive's own secure erase command (ATA Secure Erase, NVMe Format NVM), when that matters.
-- **Alternate data streams and cluster slack are not wiped.** Only the file's own data is overwritten. NTFS alternate data streams attached to a file, and the slack space between the end of the file and the end of its last cluster, are left as they are. Deliberately out of scope for this version.
+- **SSD caveat.** A software overwrite cannot guarantee physical erasure on solid state drives, USB flash media, or SD cards. Wear levelling and over-provisioning mean the drive may keep copies the file system never exposed. Use full-disk encryption from the start, or the drive's own secure erase command (ATA Secure Erase, NVMe Format NVM), when that matters. Both confirmation dialogs, the CLI preview, and the CLI run banner state this at the moment of destruction, not only here and in the report footer.
+- **Alternate data streams, cluster slack, ACLs, and extended attributes are not wiped.** Only the file's own data is overwritten. NTFS alternate data streams attached to a file, the slack space between the end of the file and the end of its last cluster, access control lists, and extended attributes are all left as they are. Deliberately out of scope for this version.
+- **Names and timestamps already recorded elsewhere cannot be removed.** The pre-deletion rename and timestamp scrub change the live directory entry only. Copies of the original name and times can survive in freed directory entries and in the file system journal (`$LogFile` and `$UsnJrnl` on NTFS, the journal on ext4), and nothing in user space can reach them. The free-space wipe is a partial mitigation for directory slack, not a fix for the journal.
+- **Verification confirms what the operating system committed.** `verifyZeroFill` reads the file back through the normal file API after `force(true)`. That proves the operating system accepted and returned the zeros; it does not prove what the physical medium now holds, and on flash storage the two are not the same thing.
+- **Hard links are detected only where the platform allows it.** Shredding a file that carries other hard-linked names destroys the shared content but removes only the queued name; the other names then point at a wiped file. The scan reports a note when it can read a link count above one, which works on Unix-like file systems and is silently unavailable on Windows, so absence of a note is not proof that a file has only one name.
 - **The erasure report names what was destroyed.** It lists absolute paths, sizes, and per-item notes, which can itself be sensitive. That is why it is off by default and why you choose where it is written.
-- **Dark-mode auto-detection is Windows only.** Every other platform starts in light mode. Use `-Ddatashredder.theme=dark` to force the dark palette there.
+- **Dark-mode auto-detection is Windows only.** Every other platform starts in light mode. `-Ddatashredder.theme=dark` forces the dark palette there, but the palette is tuned for the Windows look and feel: other look and feels honour a different set of `UIManager` keys and can end up painting dark text on dark chrome. Prefer the default light theme on those platforms.
 - **Theme detection may briefly flash a console window.** The registry probe starts `reg.exe`, a console-subsystem program, and when the parent is a console-less `javaw` process Windows can show a console window for the moment it runs. There is no way to suppress that without adding a dependency. Setting `-Ddatashredder.theme` skips the probe entirely.
 - **Drag and drop does not work into an elevated window.** Windows UIPI silently blocks a drop from a normal Explorer window onto a process running as administrator. Nothing appears to happen and no error is shown. Use the Add button instead.
 - **Pausing holds the file open.** The paused worker keeps the exclusive `FileLock` on the file it was writing, so no other program can touch that file until you resume or cancel. A paused free-space wipe also keeps the disk filled for as long as it stays paused.
